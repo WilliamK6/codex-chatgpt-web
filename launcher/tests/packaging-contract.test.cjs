@@ -9,6 +9,7 @@ const launcherRoot = path.resolve(__dirname, "..");
 const repositoryRoot = path.resolve(launcherRoot, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(launcherRoot, "package.json"), "utf8"));
 const repositoryManifest = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8"));
+const distributionRepository = "WilliamK6/codex-chatgpt-web";
 
 test("the public launcher command uses the Electron bootstrap", () => {
   assert.equal(repositoryManifest.scripts.launcher, "bun run scripts/start-launcher.ts");
@@ -51,6 +52,8 @@ test("release installers resolve checksummed native launcher assets", () => {
     assert.match(installer, /SHA-?256/i);
     assert.match(installer, /releases\/download/);
   }
+  assert.ok(shellInstaller.includes(`CODEX_WEB_GPT_REPOSITORY:-${distributionRepository}`));
+  assert.ok(windowsInstaller.includes(`else { "${distributionRepository}" }`));
   assert.match(shellInstaller, /PLATFORM="mac"/);
   assert.match(shellInstaller, /PLATFORM="linux"/);
   assert.match(shellInstaller, /codex-web-gpt\.desktop/);
@@ -93,6 +96,26 @@ test("release installers resolve checksummed native launcher assets", () => {
   const packageSmoke = fs.readFileSync(path.join(launcherRoot, "scripts", "smoke-package.cjs"), "utf8");
   assert.match(packageSmoke, /run\(installer, \["\/S", "\/currentuser"\]/);
   assert.match(packageSmoke, /reg\.exe[\s\S]*InstallLocation/);
+});
+
+test("launcher-owned links and downloads target the hardened fork", () => {
+  const updater = fs.readFileSync(path.join(launcherRoot, "electron", "update.cjs"), "utf8");
+  const main = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
+  const terminalInstaller = fs.readFileSync(path.join(repositoryRoot, "scripts", "install.sh"), "utf8");
+  const readme = fs.readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
+  const readmeZh = fs.readFileSync(path.join(repositoryRoot, "README.zh-CN.md"), "utf8");
+
+  assert.match(updater, new RegExp(`const REPOSITORY = "${distributionRepository}"`));
+  assert.ok(main.includes(`const GITHUB_URL = "https://github.com/${distributionRepository}"`));
+  assert.ok(terminalInstaller.includes(`CODEX_CHATGPT_WEB_REPOSITORY:-${distributionRepository}`));
+  assert.equal(repositoryManifest.repository.url, `git+https://github.com/${distributionRepository}.git`);
+  assert.equal(repositoryManifest.homepage, `https://github.com/${distributionRepository}#readme`);
+  assert.equal(repositoryManifest.bugs.url, `https://github.com/${distributionRepository}/issues`);
+  for (const documentation of [readme, readmeZh]) {
+    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/latest/download/install-launcher.sh`));
+    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/latest/download/install-launcher.ps1`));
+    assert.ok(documentation.includes(`git clone https://github.com/${distributionRepository}.git`));
+  }
 });
 
 test("packaged launcher owns a detached checksummed updater for every release platform", () => {
