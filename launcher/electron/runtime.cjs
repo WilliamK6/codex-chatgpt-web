@@ -410,7 +410,9 @@ class RuntimeHost {
       };
     }
     const launcherOwned = setupConfig.browserHost === "launcher";
-    const config = launcherOwned ? this.supervisor.readConfig() : setupConfig;
+    const config = launcherOwned && setupConfig.version === 4
+      ? this.supervisor.readConfig()
+      : setupConfig;
     return {
       configured: true,
       owner: launcherOwned ? "launcher" : "external",
@@ -1121,6 +1123,10 @@ class RuntimeHost {
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
     const currentVersion = this.app.getVersion();
+    const configMigrationRequired = existing.config?.version !== 4
+      || typeof existing.config?.responsesToken !== "string"
+      || !/^[A-Za-z0-9_-]{40,}$/.test(existing.config.responsesToken)
+      || existing.config.responsesToken === existing.config.controlToken;
     const connectorMigrationRequired = existing.mode === "full"
       && isLegacyConnectorName(validateConnectorName(existing.config?.appName));
     const interactionMode = existing.config?.browserInteractionMode ?? "automatic";
@@ -1144,7 +1150,8 @@ class RuntimeHost {
     if (existing.owner !== "launcher"
       || (existing.config?.releaseVersion === currentVersion
         && !connectorMigrationRequired
-        && !tunnelProfileMigrationRequired)) {
+        && !tunnelProfileMigrationRequired
+        && !configMigrationRequired)) {
       return { updated: false };
     }
     const args = [
@@ -1174,6 +1181,7 @@ class RuntimeHost {
       fromVersion: existing.config.releaseVersion,
       toVersion: currentVersion,
       connectorMigrated: connectorMigrationRequired,
+      configMigrated: configMigrationRequired,
       stdout: result.stdout,
     };
   }

@@ -83,7 +83,10 @@ export function readDevChatExperimentalFeatures(
       `Could not read DEV runtime settings from ${paths.configPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  if (!value || typeof value !== "object" || Array.isArray(value) || (value as { version?: unknown }).version !== 3) {
+  const version = value && typeof value === "object" && !Array.isArray(value)
+    ? (value as { version?: unknown }).version
+    : undefined;
+  if (version !== 3 && version !== 4) {
     throw new Error(`Invalid DEV runtime settings in ${paths.configPath}`);
   }
   const enabled = (value as { experimentalBiggerContext?: unknown }).experimentalBiggerContext;

@@ -8,20 +8,35 @@ const {
   createLogger,
   exportSanitizedLogs,
   installProcessDiagnosticGuards,
+  redactText,
   registerLoggedIpc,
   sanitize,
 } = require("../electron/logging.cjs");
 
 test("launcher logs redact tunnel ids, runtime keys, and bearer credentials", () => {
+  const responsesCapability = "responses-capability-" + "x".repeat(47);
+  assert.equal(responsesCapability.length, 68);
   assert.deepEqual(sanitize({
-    line: "tunnel_0123456789abcdef0123456789abcdef sk-exampleRuntimeSecret123",
+    line: `tunnel_0123456789abcdef0123456789abcdef sk-exampleRuntimeSecret123 http://127.0.0.1:17841/${responsesCapability}/v1/responses`,
     authorization: "Bearer this-must-never-be-recorded",
-    nested: { controlToken: "also-secret" },
+    nested: {
+      controlToken: "also-secret",
+      responsesToken: responsesCapability,
+      debugToken: "debug-capability-secret",
+    },
   }), {
-    line: "[tunnel-id] [runtime-key]",
+    line: "[tunnel-id] [runtime-key] http://127.0.0.1:17841/[redacted]/v1/responses",
     authorization: "[redacted]",
-    nested: { controlToken: "[redacted]" },
+    nested: {
+      controlToken: "[redacted]",
+      responsesToken: "[redacted]",
+      debugToken: "[redacted]",
+    },
   });
+  assert.equal(
+    redactText("Bearer opaque+token/value_with-punctuation.0123456789=="),
+    "Bearer [redacted]",
+  );
 });
 
 test("failed launcher IPC calls are written to runtime activity", async () => {
@@ -87,12 +102,15 @@ test("exported launcher logs remove local usernames, private ChatGPT titles, and
         connector: "Codex Native2",
         url: "https://chatgpt.com/c/private-conversation?state=oauth-secret&email=private@example.com",
         message: "failed while loading 'https://accounts.google.com/o/oauth2/v2/auth?state=oauth-secret&login_hint=private@example.com'",
+        responsesToken: "responses-token-that-must-never-export-0123456789",
+        debugToken: "debug-token-that-must-never-export-0123456789",
       },
     })}\n`);
 
     assert.equal(exportSanitizedLogs({ filePath, destinationPath }), 2);
     const exported = fs.readFileSync(destinationPath, "utf8");
     assert.doesNotMatch(exported, /private\.user|local-person|Private roadmap|Health notes|private prompt|private-conversation|oauth-secret|private@example\.com/);
+    assert.doesNotMatch(exported, /responses-token-that|debug-token-that/);
     assert.match(exported, /\[user-home\]/);
     assert.match(exported, /visible rows: \[redacted\]/);
     assert.match(exported, /Codex Native2/);
@@ -114,8 +132,14 @@ test("a closed Windows diagnostic pipe is recorded without becoming an uncaught 
   const stream = new PassThrough();
   try {
     installProcessDiagnosticGuards({ filePath, streams: [stream] });
-    stream.emit("error", Object.assign(new Error("write EOF"), { code: "EOF" }));
-    assert.match(fs.readFileSync(filePath, "utf8"), /write EOF/);
+    const capability = "diagnostic-capability-" + "z".repeat(44);
+    stream.emit("error", Object.assign(new Error(
+      `write EOF at http://127.0.0.1:17841/${capability}/v1 with Bearer opaque+token/value.0123456789==`,
+    ), { code: "EOF" }));
+    const diagnostic = fs.readFileSync(filePath, "utf8");
+    assert.match(diagnostic, /write EOF/);
+    assert.doesNotMatch(diagnostic, new RegExp(capability));
+    assert.doesNotMatch(diagnostic, /opaque\+token/);
   } finally {
     stream.destroy();
     fs.rmSync(root, { recursive: true, force: true });

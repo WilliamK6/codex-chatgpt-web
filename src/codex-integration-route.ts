@@ -230,7 +230,7 @@ export function installRoute(
   const previous = assignments(document.lines);
   if (previous.openai_base_url.present && !replaceExistingRoute) {
     throw new Error(
-      `Codex already configures model routing (openai_base_url=${JSON.stringify(previous.openai_base_url.value)}). `
+      "Codex already configures model routing through openai_base_url. "
       + "Rerun with --replace-codex-route to replace it reversibly. "
       + "Check whether another Codex extension or wrapper (for example, OpenCodex or Headroom) is replacing the bridge port.",
     );
@@ -243,9 +243,8 @@ export function installRoute(
     && previousRealtimeWebrtcCallBaseUrl.value !== CODEX_REALTIME_WEBRTC_CALL_BASE_URL
     && !replaceExistingRealtimeRoute) {
     throw new Error(
-      "Codex already configures its realtime WebRTC call route "
-      + `(experimental_realtime_webrtc_call_base_url=${JSON.stringify(previousRealtimeWebrtcCallBaseUrl.value)}). `
-      + "Rerun with --replace-codex-route to replace it reversibly.",
+      "Codex already configures its realtime WebRTC call route through an externally owned value. "
+      + "Rerun with --replace-codex-route to replace it reversibly; the existing URL is intentionally omitted.",
     );
   }
 

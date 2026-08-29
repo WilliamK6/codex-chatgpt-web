@@ -1,13 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import type { AppConfig } from "./config";
-import { atomicWriteFile, getConfigPath, saveConfig } from "./config";
+import { atomicWriteFile, getConfigPath, loadConfig, saveConfig } from "./config";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
   getCodexConfigPath,
   getCodexJournalPath,
   getCodexJournalRecoveryPath,
   getCodexModelsCachePath,
+  redactRouteCapability,
   restoreFileSnapshot,
   routeUrl,
   sha256,
@@ -17,6 +18,7 @@ import {
 import type {
   AnyCodexIntegrationJournal,
   CodexIntegrationJournal,
+  FileSnapshot,
   InstallCodexIntegrationOptions,
   LegacyCodexIntegrationJournalV4,
   LegacyCodexIntegrationJournalV5,
@@ -107,6 +109,68 @@ export function readCodexSubagentProtocol(
   return journal?.version === 8 || journal?.version === 9 ? journal.installed.subagent_protocol : fallback;
 }
 
+/** Capture the application config before setup may temporarily start a new runtime from it. */
+export function snapshotApplicationConfig(): FileSnapshot {
+  return snapshotFile(getConfigPath());
+}
+
+function restoreCommitSnapshots(
+  snapshots: FileSnapshot[],
+  error: unknown,
+  operation: string,
+): never {
+  const rollbackFailures: string[] = [];
+  for (const snapshot of [...snapshots].reverse()) {
+    try {
+      restoreFileSnapshot(snapshot);
+    } catch (rollbackError) {
+      rollbackFailures.push(
+        `${snapshot.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+      );
+    }
+  }
+  const primary = error instanceof Error ? error.message : String(error);
+  throw new Error(rollbackFailures.length > 0
+    ? `${primary}; ${operation} rollback also failed: ${rollbackFailures.join("; ")}`
+    : primary);
+}
+
+/**
+ * Commit the private runtime capability and the matching Codex route as one compensating
+ * filesystem transaction. The optional early config snapshot is used by setup because a
+ * terminal-managed daemon must briefly start before Codex is routed to it.
+ */
+export function commitCodexIntegrationAndConfig(
+  config: AppConfig,
+  options: InstallCodexIntegrationOptions = {},
+  priorConfigSnapshot: FileSnapshot = snapshotApplicationConfig(),
+): CodexIntegrationJournal {
+  if (priorConfigSnapshot.path !== getConfigPath()) {
+    throw new Error("Application config snapshot does not target the active setup home");
+  }
+  // readJournal may repair a missing journal copy, so preserve both copies before asking it for
+  // the legacy catalog path. A v2 migration deletes that catalog after writing the new route; it
+  // therefore participates in the same rollback as config.toml, models_cache, and both journals.
+  const journalSnapshot = snapshotFile(getCodexJournalPath());
+  const recoverySnapshot = snapshotFile(getCodexJournalRecoveryPath());
+  const existingJournal = readJournal();
+  const snapshots = [
+    priorConfigSnapshot,
+    snapshotFile(getCodexConfigPath()),
+    snapshotFile(getCodexModelsCachePath()),
+    ...(existingJournal?.version === 2 ? [snapshotFile(existingJournal.catalogPath)] : []),
+    journalSnapshot,
+    recoverySnapshot,
+  ];
+  try {
+    const journal = installCodexIntegration(config, options);
+    saveConfig(config);
+    return journal;
+  } catch (error) {
+    return restoreCommitSnapshots(snapshots, error, "Codex route/config");
+  }
+}
+
 export function setCodexSubagentProtocol(
   config: AppConfig,
   protocol: AppConfig["subagentProtocol"],
@@ -120,33 +184,7 @@ export function setCodexSubagentProtocol(
   // The runtime catalog and Codex feature surface are two halves of one protocol selection. If
   // either write fails, restore every participant so the next launcher/Codex restart cannot load a
   // split V1/V2 state.
-  const snapshots = [
-    getConfigPath(),
-    getCodexConfigPath(),
-    getCodexModelsCachePath(),
-    getCodexJournalPath(),
-    getCodexJournalRecoveryPath(),
-  ].map(snapshotFile);
-  try {
-    const journal = installCodexIntegration(nextConfig);
-    saveConfig(nextConfig);
-    return journal;
-  } catch (error) {
-    const rollbackFailures: string[] = [];
-    for (const snapshot of [...snapshots].reverse()) {
-      try {
-        restoreFileSnapshot(snapshot);
-      } catch (rollbackError) {
-        rollbackFailures.push(
-          `${snapshot.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-        );
-      }
-    }
-    const primary = error instanceof Error ? error.message : String(error);
-    throw new Error(rollbackFailures.length > 0
-      ? `${primary}; subagent protocol rollback also failed: ${rollbackFailures.join("; ")}`
-      : primary);
-  }
+  return commitCodexIntegrationAndConfig(nextConfig);
 }
 
 export function preflightCodexIntegration(
@@ -352,8 +390,14 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
 export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
   const existing = readJournal();
   if (!existing) throw new Error("Codex integration is not installed");
+  const config = loadConfig();
   if (existing.version === 2) {
     throw new Error("Legacy Codex integration must be upgraded by Setup before the bridge can be reconnected");
+  }
+  if (existing.installed.openai_base_url !== routeUrl(config)) {
+    throw new Error(
+      "Codex integration route does not match the current application config; run Setup to migrate it before reconnecting",
+    );
   }
   assertJournalTargetsConfig(existing, getCodexConfigPath());
   if (!existsSync(existing.configPath)) throw new Error(`Codex config is missing: ${existing.configPath}`);
@@ -498,9 +542,13 @@ export function inspectCodexIntegration(): {
       : Boolean(journal),
     configPath: getCodexConfigPath(),
     ...(journal?.version === 3 || journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9
-      ? { routeUrl: journal.installed.openai_base_url }
+      ? { routeUrl: redactRouteCapability(journal.installed.openai_base_url) }
       : {}),
-    ...(journal ? { journal } : {}),
+    ...(journal ? {
+      journal: JSON.parse(JSON.stringify(journal, (_key, value) => (
+        typeof value === "string" ? redactRouteCapability(value) : value
+      ))) as AnyCodexIntegrationJournal,
+    } : {}),
     errors,
   };
 }

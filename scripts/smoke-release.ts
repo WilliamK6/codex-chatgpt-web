@@ -63,7 +63,7 @@ const portServer = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data()
 const port = portServer.port;
 portServer.stop();
 const config = {
-  version: 3,
+  version: 4,
   releaseVersion: VERSION,
   mode: "browser-only",
   host: "127.0.0.1",
@@ -78,6 +78,7 @@ const config = {
   proAvailable: true,
   autoApproveToolCalls: false,
   controlToken: "release-smoke-control-token-0123456789abcdef",
+  responsesToken: "release-smoke-responses-token-0123456789abcdefghij",
   runtimeCommand,
   acknowledgedUnofficialAt: new Date().toISOString(),
 };
@@ -103,17 +104,22 @@ try {
     throw new Error(`unexpected health payload: ${JSON.stringify(payload)}`);
   }
 
-  const unauthenticatedModels = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  const responsesBase = `http://127.0.0.1:${port}/${config.responsesToken}/v1`;
+  const unprefixedModels = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  if (unprefixedModels.status !== 404) {
+    throw new Error(`unprefixed model route did not fail closed: HTTP ${unprefixedModels.status}`);
+  }
+  const unauthenticatedModels = await fetch(`${responsesBase}/models`);
   const unauthenticatedModelsBody = await unauthenticatedModels.json() as { error?: { message?: string } };
   if (unauthenticatedModels.status !== 502
     || !unauthenticatedModelsBody.error?.message?.includes("incoming Bearer authorization")) {
-    throw new Error(`native model passthrough did not fail closed without Codex auth: ${JSON.stringify(unauthenticatedModelsBody)}`);
+    throw new Error(`native model passthrough did not preserve Codex auth requirements: ${JSON.stringify(unauthenticatedModelsBody)}`);
   }
-  const websocketNegotiation = await fetch(`http://127.0.0.1:${port}/v1/responses`);
+  const websocketNegotiation = await fetch(`${responsesBase}/responses`);
   if (websocketNegotiation.status !== 426) {
     throw new Error(`Responses WebSocket negotiation did not select Codex HTTP/SSE fallback: HTTP ${websocketNegotiation.status}`);
   }
-  const invalid = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+  const invalid = await fetch(`${responsesBase}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "chatgpt-web/not-enabled", input: "test", stream: false }),
@@ -135,7 +141,7 @@ try {
     || drainPayload.active_http_turns !== 0 || drainPayload.active_browser_turns !== 0) {
     throw new Error(`daemon did not acknowledge an idle authenticated drain: ${JSON.stringify(drainPayload)}`);
   }
-  const rejectedWhileDraining = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+  const rejectedWhileDraining = await fetch(`${responsesBase}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "chatgpt-web/high", reasoning: { effort: "high" }, input: "test", stream: false }),

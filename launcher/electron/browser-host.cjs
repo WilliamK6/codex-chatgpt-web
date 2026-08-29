@@ -1,6 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { createHash, randomBytes } = require("node:crypto");
+const { createHash, randomBytes, timingSafeEqual } = require("node:crypto");
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const {
@@ -96,6 +96,17 @@ function combinedError(primary, label, secondary) {
   const first = primary instanceof Error ? primary.message : String(primary);
   const second = secondary instanceof Error ? secondary.message : String(secondary);
   return new Error(`${first}; ${label}: ${second}`);
+}
+
+function newDebugLeaseToken() {
+  return randomBytes(32).toString("base64url");
+}
+
+function debugLeaseTokenMatches(expected, supplied) {
+  if (typeof expected !== "string" || typeof supplied !== "string") return false;
+  const wanted = Buffer.from(expected);
+  const actual = Buffer.from(supplied);
+  return actual.length === wanted.length && timingSafeEqual(actual, wanted);
 }
 
 function visibleElementScript(selector) {
@@ -303,8 +314,8 @@ class BrowserHost {
   constructor({
     window,
     descriptorPath,
-    cdpPort,
     control,
+    debug,
     cancelTurn,
     getConnectorName,
     helper,
@@ -316,6 +327,7 @@ class BrowserHost {
     showWindow = () => {},
     clipboardApi = clipboard,
     getBrowserInteractionMode = () => "automatic",
+    revokeDebugSurface,
   }) {
     if (typeof getConnectorName !== "function") {
       throw new Error("Browser host connector-name resolver is unavailable");
@@ -325,8 +337,8 @@ class BrowserHost {
     }
     this.window = window;
     this.descriptorPath = descriptorPath;
-    this.cdpPort = cdpPort;
     this.control = control;
+    this.debug = debug;
     this.cancelTurn = cancelTurn;
     this.getConnectorName = getConnectorName;
     this.helper = helper;
@@ -345,6 +357,7 @@ class BrowserHost {
     this.showWindow = showWindow;
     this.clipboard = clipboardApi;
     this.getBrowserInteractionMode = getBrowserInteractionMode;
+    this.revokeDebugSurface = typeof revokeDebugSurface === "function" ? revokeDebugSurface : () => {};
     this.runBrowserHelperOperation = runBrowserHelperOperation;
     this.verifyConnectorWithBrowserHelper = verifyConnectorWithBrowserHelper;
     this.surfaceId = randomBytes(24).toString("base64url");
@@ -357,6 +370,7 @@ class BrowserHost {
     this.interactionModeOverride = null;
     this.selectedTabId = "home";
     this.manualOperation = null;
+    this.manualHelperLeases = new Map();
     this.loginOperation = null;
     this.sessionRefreshOperation = null;
     this.cloudflareChallengeRecovery = null;
@@ -491,6 +505,41 @@ class BrowserHost {
     return [...this.turnTabs.values()].find((tab) => tab.status === "running")?.traceId || null;
   }
 
+  browserHelperAuthorization() {
+    if (!this.manualHelperLeases) this.manualHelperLeases = new Map();
+    const debugLeaseToken = newDebugLeaseToken();
+    return {
+      debugLeaseToken,
+      onSpawn: helperPid => this.manualHelperLeases.set(helperPid, debugLeaseToken),
+      onExit: helperPid => {
+        if (!debugLeaseTokenMatches(this.manualHelperLeases.get(helperPid), debugLeaseToken)) return;
+        this.manualHelperLeases.delete(helperPid);
+        const contents = this.view?.webContents;
+        if (contents && !contents.isDestroyed()) this.revokeDebugSurface?.(contents);
+      },
+    };
+  }
+
+  resolveDebugSurface(surfaceId, helperPid, debugLeaseToken) {
+    if (surfaceId === this.surfaceId) {
+      if (!this.manualOperation
+        || !debugLeaseTokenMatches(this.manualHelperLeases?.get(helperPid), debugLeaseToken)) {
+        throw new Error("home browser surface is not owned by this helper operation");
+      }
+      return this.view.webContents;
+    }
+    const matches = [...this.turnTabs.values()].filter(tab => tab.surfaceId === surfaceId);
+    if (matches.length !== 1) throw new Error("browser surface is not available");
+    const tab = matches[0];
+    if (tab.status !== "running"
+      || tab.helperPid !== helperPid
+      || !debugLeaseTokenMatches(tab.debugLeaseToken, debugLeaseToken)
+      || !processRunning(helperPid)) {
+      throw new Error("browser surface is not owned by this active helper");
+    }
+    return tab.view.webContents;
+  }
+
   tabSnapshot(tab) {
     const snapshot = {
       id: tab.id,
@@ -547,6 +596,7 @@ class BrowserHost {
       connectorIdentity,
       connectorBound: false,
       helperPid,
+      debugLeaseToken: newDebugLeaseToken(),
       view,
       status: "running",
       ordinal,
@@ -1471,6 +1521,11 @@ class BrowserHost {
 
   removeTurnTab(tab, abortRunning) {
     if (!this.turnTabs.has(tab.id)) return;
+    const contents = tab.view?.webContents;
+    if (contents && !contents.isDestroyed() && tab.debugLeaseToken) {
+      this.revokeDebugSurface?.(contents);
+    }
+    tab.debugLeaseToken = null;
     this.turnTabs.delete(tab.id);
     if (tab.interactionMode === "manual") {
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
@@ -2169,6 +2224,9 @@ class BrowserHost {
           evidence: "previous helper exited",
         });
       }
+      const contents = existing.view?.webContents;
+      if (contents && !contents.isDestroyed()) this.revokeDebugSurface?.(contents);
+      existing.debugLeaseToken = newDebugLeaseToken();
       existing.helperPid = helperPid;
       existing.traceId = traceId;
       existing.status = "running";
@@ -2190,6 +2248,7 @@ class BrowserHost {
       this.logger.info("browser.tab_reused", { tabId: existing.id, traceId });
       return {
         surfaceId: existing.surfaceId,
+        debugLeaseToken: existing.debugLeaseToken,
         tabId: existing.id,
         reused,
         connectorBound: existing.connectorBound === true,
@@ -2206,7 +2265,13 @@ class BrowserHost {
     else this.syncViewVisibility();
     this.publishState?.(this.snapshot());
     this.logger.info("browser.tab_created", { tabId: tab.id, traceId, tabCount: this.turnTabs.size });
-    return { surfaceId: tab.surfaceId, tabId: tab.id, reused: false, connectorBound: false };
+    return {
+      surfaceId: tab.surfaceId,
+      debugLeaseToken: tab.debugLeaseToken,
+      tabId: tab.id,
+      reused: false,
+      connectorBound: false,
+    };
   }
 
   async endTurn(
@@ -2234,6 +2299,9 @@ class BrowserHost {
       );
     }
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
+    const contents = tab.view?.webContents;
+    if (contents && !contents.isDestroyed()) this.revokeDebugSurface?.(contents);
+    tab.debugLeaseToken = null;
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
     this.syncPowerSaveBlocker();
     tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
@@ -2652,6 +2720,7 @@ class BrowserHost {
       appName: connectorName,
       operation: "smoke",
       logger: this.logger,
+      ...this.browserHelperAuthorization(),
     });
     const evidence = result?.value;
     if (!evidence
@@ -2680,6 +2749,7 @@ class BrowserHost {
       descriptorPath: this.descriptorPath,
       appName: connectorName,
       logger: this.logger,
+      ...this.browserHelperAuthorization(),
     });
     this.logger.info("connector.verified", { appName: connectorName });
     this.setState({ status: "ready", message: "ChatGPT connector is available", authenticated: true });
@@ -2707,6 +2777,7 @@ class BrowserHost {
       operation: "inspect",
       payload: { detectCapabilities },
       logger: this.logger,
+      ...this.browserHelperAuthorization(),
     });
     const inspected = result?.value;
     if (!inspected || inspected.authenticated !== true || inspected.temporary !== true || typeof inspected.url !== "string") {
@@ -2743,17 +2814,18 @@ class BrowserHost {
       throw error;
     } finally {
       if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(true);
+      if (contents && !contents.isDestroyed()) this.revokeDebugSurface?.(contents);
       this.manualOperation = null;
     }
   }
 
   writeDescriptor() {
     const descriptor = {
-      version: 2,
+      version: 3,
       kind: "codex-web-gpt-launcher",
       profile: this.profile,
       pid: process.pid,
-      endpoint: `http://127.0.0.1:${this.cdpPort}`,
+      debug: this.debug,
       control: this.control,
       helper: this.helper,
       partition: this.partition,
@@ -2795,6 +2867,9 @@ class BrowserHost {
       powerSaveBlocker.stop(this.powerSaveBlockerId);
       this.powerSaveBlockerId = null;
     }
+    const homeContents = this.view?.webContents;
+    if (homeContents && !homeContents.isDestroyed()) this.revokeDebugSurface?.(homeContents);
+    this.manualHelperLeases?.clear();
     for (const tab of this.turnTabs.values()) {
       if (tab.interactionMode === "manual") {
         if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
@@ -2805,6 +2880,9 @@ class BrowserHost {
         for (const resolve of tab.manualTerminalWaiters || []) resolve({ status: "cancelled" });
         tab.manualTerminalWaiters?.clear();
       }
+      const contents = tab.view?.webContents;
+      if (contents && !contents.isDestroyed()) this.revokeDebugSurface?.(contents);
+      tab.debugLeaseToken = null;
       try { this.window.contentView.removeChildView(tab.view); } catch {}
       if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
     }

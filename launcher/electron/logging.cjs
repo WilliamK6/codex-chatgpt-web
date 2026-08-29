@@ -10,7 +10,11 @@ function redactText(value) {
   const redacted = value
     .replace(/tunnel_[a-f0-9]{32}/g, "[tunnel-id]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[runtime-key]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~-]{20,}\b/gi, "Bearer [redacted]");
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{20,}=*/gi, "Bearer [redacted]")
+    .replace(
+      /(https?:\/\/127\.0\.0\.1:\d+\/)[A-Za-z0-9_-]{40,}(\/v1(?:\/[^\s"'`]*)?)/gi,
+      "$1[redacted]$2",
+    );
   return redacted.length > MAX_LOG_STRING_CHARS
     ? `${redacted.slice(0, MAX_LOG_STRING_CHARS)}…[truncated]`
     : redacted;
@@ -45,6 +49,7 @@ function sanitizeForExport(value, seen = new WeakSet()) {
     Object.entries(value).map(([key, item]) => [
       key,
       /^(?:prompt|response|html|dom|content|visibleRows|sidebarRows|sidebarTitles|conversationTitle|conversationTitles|chatTitle|chatTitles)$/i.test(key)
+        || /(?:authorization|cookie|runtimeKey|controlToken|responsesToken|debugToken|^token$)/i.test(key)
         ? "[redacted]"
         : sanitizeForExport(item, seen),
     ]),
@@ -103,7 +108,7 @@ function sanitize(value, seen = new WeakSet()) {
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      /(?:authorization|cookie|runtimeKey|controlToken)/i.test(key)
+      /(?:authorization|cookie|runtimeKey|controlToken|responsesToken|debugToken|^token$)/i.test(key)
         ? "[redacted]"
         : sanitize(item, seen),
     ]),
@@ -185,7 +190,7 @@ function installProcessDiagnosticGuards({ filePath, streams = [process.stdout, p
         fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
         fs.appendFileSync(
           filePath,
-          `${new Date().toISOString()} ${error instanceof Error ? error.stack || error.message : String(error)}\n`,
+          `${new Date().toISOString()} ${redactText(error instanceof Error ? error.stack || error.message : String(error))}\n`,
           { mode: 0o600 },
         );
       } catch {

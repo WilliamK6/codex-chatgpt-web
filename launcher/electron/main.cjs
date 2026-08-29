@@ -1,5 +1,4 @@
 const fs = require("node:fs");
-const net = require("node:net");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
@@ -17,11 +16,13 @@ const {
 } = require("electron");
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
+const { BrowserDebugServer } = require("./browser-debug-server.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
   createLogger,
   exportSanitizedLogs,
   installProcessDiagnosticGuards,
+  redactText,
   registerLoggedIpc,
 } = require("./logging.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
@@ -80,30 +81,17 @@ let mainWindowShowRequested = false;
 let browserHost = null;
 let runtimeHost = null;
 let browserControl = null;
+let browserDebug = null;
 let runtimeSupervisor = null;
 let tray = null;
 let quitting = false;
 let shutdownInProgress = false;
 let exitCommitted = false;
 let smokePassedThisSession = false;
-let cdpPort = 0;
 let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
 let updateController = null;
-
-function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      const port = address && typeof address === "object" ? address.port : 0;
-      server.close((error) => error ? reject(error) : resolve(port));
-    });
-  });
-}
 
 function send(channel, value) {
   if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
@@ -382,7 +370,7 @@ function createWindow({ logger, stateStore, windowStatePath, startHidden }) {
       message: error instanceof Error ? error.message : String(error),
     });
   });
-  logger.info("launcher.window_created", { platform: process.platform, cdpPort });
+  logger.info("launcher.window_created", { platform: process.platform });
   return window;
 }
 
@@ -879,6 +867,7 @@ async function requestQuit() {
     stopCatalogVerificationMonitor();
     quitting = true;
     await browserHost?.persistSession();
+    await browserDebug?.close();
     browserHost?.destroy();
     await browserControl?.close();
     exitCommitted = true;
@@ -896,6 +885,10 @@ async function requestQuit() {
 }
 
 async function start() {
+  if (process.platform === "linux") {
+    app.commandLine.appendSwitch("class", IS_DEV_PROFILE ? "codex-web-gpt-dev" : "codex-web-gpt");
+  }
+
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
     app.quit();
@@ -973,6 +966,10 @@ async function start() {
     getBrowserHost: () => browserHost,
     getPreferences: () => stateStore.read(),
   }).start();
+  browserDebug = await new BrowserDebugServer({
+    logger,
+    getBrowserHost: () => browserHost,
+  }).start();
   runtimeSupervisor = new RuntimeSupervisor({
     app,
     logger,
@@ -1006,8 +1003,8 @@ async function start() {
   browserHost = new BrowserHost({
     window: mainWindow,
     descriptorPath: BROWSER_DESCRIPTOR_PATH,
-    cdpPort,
     control: browserControl.descriptor(),
+    debug: browserDebug.descriptor(),
     cancelTurn: IS_DEV_PROFILE ? undefined : traceId => runtimeSupervisor.cancelBrowserTurn(traceId),
     getConnectorName: () => runtimeHost.browserConnectorName(),
     helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
@@ -1018,6 +1015,7 @@ async function start() {
     publishState: (state) => send("launcher:browser-state", state),
     showWindow: showMainWindow,
     getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
+    revokeDebugSurface: contents => browserDebug.revokeSurface(contents),
   });
   await browserHost.ready();
   const updaterRuntimeRoot = runtimeRootProvider();
@@ -1080,6 +1078,7 @@ async function start() {
       packaged: app.isPackaged,
       runtimeVerified: true,
     })}\n`);
+    await browserDebug.close();
     browserHost.destroy();
     await browserControl.close();
     mainWindow.destroy();
@@ -1256,7 +1255,10 @@ async function start() {
 void start().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   try {
-    fs.appendFileSync(path.join(app.getPath("logs"), "launcher-fatal.log"), `${new Date().toISOString()} ${error?.stack || error}\n`);
+    fs.appendFileSync(
+      path.join(app.getPath("logs"), "launcher-fatal.log"),
+      `${new Date().toISOString()} ${redactText(error?.stack || String(error))}\n`,
+    );
   } catch {}
   try {
     dialog.showErrorBox("Codex Web GPT could not start", message);

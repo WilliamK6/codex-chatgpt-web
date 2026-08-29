@@ -59,11 +59,14 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
   writeFileSync(descriptorHelper, "process.exit(99);\n", { mode: 0o700 });
   const descriptorPath = join(root, "launcher.json");
   writeFileSync(descriptorPath, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: "production",
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39001",
+    debug: {
+      endpoint: "tcp://127.0.0.1:39001",
+      token: "launcher-debug-token-0123456789abcdefghijklmnopqr",
+    },
     control: {
       endpoint: "http://127.0.0.1:39002",
       token: "launcher-control-token-0123456789abcdefghijklmnop",

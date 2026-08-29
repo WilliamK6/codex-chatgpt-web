@@ -47,12 +47,25 @@ async function stopChild(child) {
   }
 }
 
-async function runBrowserHelperOperation({ helper, descriptorPath, appName, operation, payload = {}, logger }) {
+async function runBrowserHelperOperation({
+  helper,
+  descriptorPath,
+  appName,
+  operation,
+  payload = {},
+  logger,
+  debugLeaseToken,
+  onSpawn,
+  onExit,
+}) {
   if (!helper || typeof helper.executable !== "string" || typeof helper.script !== "string") {
     throw new Error("Browser helper verification command is invalid");
   }
   if (typeof descriptorPath !== "string" || !descriptorPath || typeof appName !== "string" || !appName) {
     throw new Error("Browser helper verification config is invalid");
+  }
+  if (typeof debugLeaseToken !== "string" || !/^[A-Za-z0-9_-]{40,}$/.test(debugLeaseToken)) {
+    throw new Error("Browser helper verification lease is invalid");
   }
   if (!["verify", "inspect", "smoke"].includes(operation)) {
     throw new Error(`Unsupported browser helper operation: ${String(operation)}`);
@@ -67,6 +80,17 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
+  if (!Number.isInteger(child.pid) || child.pid < 1) {
+    child.kill();
+    throw new Error("Browser helper verification did not receive a process id");
+  }
+  const helperPid = child.pid;
+  try {
+    onSpawn?.(helperPid);
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
   let completed = false;
   let sent = false;
   let timer;
@@ -111,7 +135,7 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
           ...payload,
           type: operation,
           id,
-          config: { appName, browserHostDescriptorPath: descriptorPath },
+          config: { appName, browserHostDescriptorPath: descriptorPath, debugLeaseToken },
         }).catch(error => finish(error instanceof Error ? error : new Error(String(error))));
         return;
       }
@@ -155,6 +179,7 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
   } finally {
     output.close();
     errors.close();
+    try { onExit?.(helperPid); } catch {}
   }
   if (primaryError) throw primaryError;
   return value;

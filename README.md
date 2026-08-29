@@ -99,6 +99,11 @@ The launcher detects the current account's ChatGPT controls during setup: Free/G
 only Luna, while Pro appears only when the signed-in account exposes it. The separate **MCP** page
 is optional and guides the full-harness setup without terminal commands.
 
+Model installation stores a random Responses capability inside the managed `openai_base_url`.
+Treat that complete URL as a local secret: do not paste it into chats, issues, or logs. Installation
+and upgrades commit the launcher config, Codex route, and recovery journals transactionally; after
+a successful change, restart Codex once so it loads the new route.
+
 The packaged launcher keeps sign-in and ChatGPT model turns in its embedded browser. It needs no
 model API key, installed Chrome/Chromium, system Node/Bun, or project-managed browser download.
 
@@ -178,8 +183,11 @@ codex-chatgpt-web subagents native
 
 - This is unofficial browser automation, not an OpenAI API. ChatGPT UI changes can break selectors;
   drift fails explicitly instead of silently switching model or transport.
-- Browser state is a sensitive login artifact, and the loopback listener is reachable by processes
-  running as the same local user. Never share the launcher profile; use a trusted workstation.
+- Browser state and the capability-bearing local route are sensitive credentials. Functional
+  Responses routes require that capability, lifecycle control uses a different bearer, and browser
+  automation uses an authenticated private Electron debug broker instead of a raw DevTools port.
+  Arbitrary code running as the same OS user may still read these owner-only files, so never share
+  the launcher profile or managed `openai_base_url`; use a trusted workstation.
 - Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. Runtime,
   tests, and packaging are gated on all three in CI; account-bound browser and MCP flows use the
   separate [release validation](docs/release-validation.md).
@@ -205,8 +213,10 @@ bun run app:package
 `dev:launcher` starts a second launcher profile under `~/.codex-chatgpt-web-dev`: separate Electron
 state, browser cookies/login, ChatGPT account, configuration, sandboxed `CODEX_HOME`, chats,
 diagnostics, broker, and tunnel profile. It can run beside the normal launcher and never starts a
-Responses daemon or changes Codex. Optional Full setup starts and supervises only its isolated MCP
-tunnel, using the distinct ChatGPT connector name `Codex Native2 DEV`.
+Responses or health listener, installs an `openai_base_url`, or changes Codex. Its browser helpers
+still use the DEV launcher's authenticated private debug broker. Optional Full setup starts and
+supervises only its isolated MCP tunnel, using the distinct ChatGPT connector name
+`Codex Native2 DEV`.
 
 `dev:chat` is a named, persistent synthetic outer-Codex harness. It executes the current working
 tree through that isolated launcher browser, Temporary Chat, prompt compiler, Responses parser, and
