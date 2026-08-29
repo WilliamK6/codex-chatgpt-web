@@ -72,6 +72,9 @@
       "signIgnore": [
         "[/\\\\]Contents[/\\\\]Resources[/\\\\]runtime[/\\\\]runtime[/\\\\]bun$"
       ],
+      "extendInfo": {
+        "NSHumanReadableCopyright": "Copyright © 2026 miuuyy — Codex Macbook Pro"
+      },
       "target": ["dmg", "zip"]
     },
     "win": {

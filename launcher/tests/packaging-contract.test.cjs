@@ -26,6 +26,10 @@ test("the full verification gate audits launcher dependencies", () => {
 test("launcher publishes native packages for all supported desktop operating systems", () => {
   assert.equal(manifest.build.appId, "dev.codexwebgpt.launcher");
   assert.equal(manifest.build.artifactName, "codex-web-gpt-${version}-${os}-${arch}.${ext}");
+  assert.equal(
+    manifest.build.mac.extendInfo.NSHumanReadableCopyright,
+    "Copyright © 2026 miuuyy — Codex Macbook Pro",
+  );
   assert.deepEqual(manifest.build.mac.target, ["dmg", "zip"]);
   assert.deepEqual(
     manifest.build.mac.signIgnore,
