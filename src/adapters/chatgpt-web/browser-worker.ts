@@ -750,6 +750,7 @@ export interface ResolvedBrowserConfig {
   appName: string;
   browserHost: "managed-chrome" | "launcher";
   browserHostDescriptorPath?: string;
+  debugLeaseToken?: string;
   browserHelperScriptPath?: string;
   browserDiagnosticsPath?: string;
   storageStatePath: string;
@@ -1294,8 +1295,18 @@ export function chatGptPromptFilePayloads(
 }
 
 export class ChatGptBrowserWorker {
-  static forProvider(provider: CodexProviderConfig): ChatGptBrowserWorker {
-    const config = resolveBrowserConfig(provider);
+  static forProvider(
+    provider: CodexProviderConfig,
+    privateOptions: { debugLeaseToken?: string } = {},
+  ): ChatGptBrowserWorker {
+    const debugLeaseToken = privateOptions.debugLeaseToken;
+    if (debugLeaseToken !== undefined && !/^[A-Za-z0-9_-]{40,}$/.test(debugLeaseToken)) {
+      throw new Error("Launcher browser worker received an invalid private debug lease");
+    }
+    const config = {
+      ...resolveBrowserConfig(provider),
+      ...(debugLeaseToken ? { debugLeaseToken } : {}),
+    };
     const key = JSON.stringify(config);
     let worker = workers.get(key);
     if (!worker) {
@@ -1467,7 +1478,15 @@ export class ChatGptBrowserWorker {
   private async ensurePage(): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
     if (this.config.browserHost === "launcher") {
-      const connection = await connectLauncherBrowserHost(this.config.browserHostDescriptorPath!);
+      if (!this.config.debugLeaseToken) {
+        throw new Error("Launcher browser maintenance requires a private debug lease");
+      }
+      const connection = await connectLauncherBrowserHost(
+        this.config.browserHostDescriptorPath!,
+        20_000,
+        undefined,
+        this.config.debugLeaseToken,
+      );
       this.browser = connection.browser;
       this.context = connection.context;
       this.page = connection.page;
@@ -2996,6 +3015,7 @@ export class ChatGptBrowserWorker {
       throw error;
     });
     const surfaceId = lease.surfaceId;
+    const debugLeaseToken = lease.debugLeaseToken;
     const reused = lease.reused === true;
     let terminal: "completed" | "failed" | "aborted" = "completed";
     let terminalMessage: string | undefined;
@@ -3023,6 +3043,7 @@ export class ChatGptBrowserWorker {
     };
     try {
       if (!surfaceId) throw new Error("Launcher did not lease a browser tab for the ChatGPT turn");
+      if (!debugLeaseToken) throw new Error("Launcher did not issue a private debug lease for the ChatGPT turn");
       if (turn.requireRetainedConversation && !reused) {
         throw chatGptRetainedConversationUnavailableError();
       }
@@ -3032,7 +3053,7 @@ export class ChatGptBrowserWorker {
       await turn.onPreparedSelected?.(reused);
       heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref?.();
-      return await this.runBrowserTurn(turn, surfaceId, undefined, reused);
+      return await this.runBrowserTurn(turn, surfaceId, undefined, reused, debugLeaseToken);
     } catch (error) {
       originalError = error;
       terminal = (error instanceof DOMException && error.name === "AbortError")
@@ -3073,6 +3094,7 @@ export class ChatGptBrowserWorker {
     launcherSurfaceId?: string,
     maintenancePage?: Page,
     reuseConversation = false,
+    launcherDebugLeaseToken?: string,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.captureLunaCheckpoint === true) !== (turn.onLunaCheckpoint !== undefined)) {
@@ -3176,6 +3198,7 @@ export class ChatGptBrowserWorker {
           this.config.browserHostDescriptorPath!,
           browserStageTimeouts.browserPage,
           launcherSurfaceId,
+          launcherDebugLeaseToken,
           abortSignal,
         );
         if (abortSignal.aborted) {
@@ -3195,6 +3218,15 @@ export class ChatGptBrowserWorker {
           + ` ${redactChatGptUiDiagnostic(cause.message)}`,
         );
         const previousConnection = turnConnection;
+        turnConnection = undefined;
+        if (previousConnection) {
+          await previousConnection.close().catch(error => {
+            console.warn(
+              `[chatgpt-web] previous browser observation connection did not close before rebind:`
+              + ` ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+        }
         const connection = await this.runStage(
           turn.traceId,
           `response_page_rebind_${attempt}`,
@@ -3207,6 +3239,7 @@ export class ChatGptBrowserWorker {
               this.config.browserHostDescriptorPath!,
               browserStageTimeouts.browserPage,
               launcherSurfaceId,
+              launcherDebugLeaseToken,
               signal,
             );
             await waitForOperationalChatGptViewport(rebound.page, signal);
@@ -3216,14 +3249,6 @@ export class ChatGptBrowserWorker {
         turnConnection = connection.browser;
         page = connection.page;
         diagnosticPage = page;
-        if (previousConnection && previousConnection !== connection.browser) {
-          await previousConnection.close().catch(error => {
-            console.warn(
-              `[chatgpt-web] previous browser observation connection did not close after rebind:`
-              + ` ${error instanceof Error ? error.message : String(error)}`,
-            );
-          });
-        }
         console.warn(
           `[chatgpt-web] browser turn ${turn.traceId} rebound its existing launcher page after a stalled DOM probe`,
         );

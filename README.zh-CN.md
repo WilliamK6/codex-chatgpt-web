@@ -97,6 +97,10 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 支持 Pro 时，Pro 才会显示。独立的 **MCP** 页面是可选项，它会在不需要终端命令的情况下引导你
 完成完整 harness 设置。
 
+模型安装会在托管的 `openai_base_url` 中保存一个随机 Responses 能力值。完整 URL 是本地秘密：
+不要将它粘贴到聊天、issue 或日志中。安装和升级会以事务方式提交启动器配置、Codex 路由和
+恢复日志；成功更改后请重启一次 Codex，使其加载新路由。
+
 打包后的启动器在其内置浏览器中完成登录并运行 ChatGPT 模型轮次，不需要模型 API 密钥、已安装的
 Chrome/Chromium、系统级 Node/Bun，也不会由本项目另行下载浏览器。
 
@@ -164,8 +168,10 @@ bun run app
 - ChatGPT 针对不同账户设置的输入框上限小于某些底层模型的上下文窗口。实测边界以及实现更大且
   确定性传输的要求记录在
   [#76](https://github.com/miuuyy/codex-chatgpt-web/issues/76) 中。
-- 浏览器状态是敏感的登录凭据，loopback 监听器也可被同一本地用户运行的进程访问。切勿共享
-  启动器 profile，并仅在可信工作站上使用。
+- 浏览器状态和携带能力值的本地路由都是敏感凭据。功能性 Responses 路由要求该能力值，
+  生命周期控制使用另一个 bearer，浏览器自动化则使用经过身份验证的 Electron 私有调试代理，
+  而不是原始 DevTools 端口。但是，以同一 OS 用户身份运行的任意代码仍可能读取这些仅所有者可读的
+  文件，因此切勿共享启动器 profile 或托管的 `openai_base_url`，并仅在可信工作站上使用。
 - 发布包目前支持 macOS 13+（arm64/x64）、Windows x64 和 Linux x64。核心运行时、测试和原生
   打包会在 CI 中对三种操作系统进行检查；依赖账户的浏览器与 MCP 流程必须另行完成
   [发布验证](docs/release-validation.md)，打包 smoke 不视为端到端证明。
@@ -182,6 +188,10 @@ bun run app
 bun run verify
 bun run app:package
 ```
+
+仓库 DEV driver 直接调用进程内 Responses 处理器，不启动 Responses 或 health 监听器，不安装
+`openai_base_url`，也不更改正在运行的 Codex 路由。它的浏览器 helper 仍只通过 DEV 启动器的
+经过身份验证的私有调试代理连接。
 
 - [架构说明](docs/architecture.md)
 - [安全模型](docs/security-model.md)

@@ -255,6 +255,22 @@ test("a stalled post-submit DOM probe is bounded before same-page launcher recov
   expect(runBrowserTurn.slice(recovery)).toContain("responseTurn.identity");
 });
 
+test("launcher rebind releases the exclusive debug attachment before reconnecting", () => {
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const rebindStart = workerSource.indexOf("const rebindLauncherPage = async");
+  const rebindEnd = workerSource.indexOf('await diagnostics.capture(page, "browser-page-acquired")', rebindStart);
+  const rebind = workerSource.slice(rebindStart, rebindEnd);
+  const clearActive = rebind.indexOf("turnConnection = undefined");
+  const closePrevious = rebind.indexOf("await previousConnection.close()");
+  const reconnect = rebind.indexOf("await connectLauncherBrowserHost(");
+
+  expect(rebindStart).toBeGreaterThan(-1);
+  expect(rebindEnd).toBeGreaterThan(rebindStart);
+  expect(clearActive).toBeGreaterThan(-1);
+  expect(closePrevious).toBeGreaterThan(clearActive);
+  expect(reconnect).toBeGreaterThan(closePrevious);
+});
+
 test("closing the launcher page is an immediate terminal turn error", async () => {
   const responseDomSnapshot = (ChatGptBrowserWorker.prototype as unknown as {
     responseDomSnapshot(responseTurn: unknown): Promise<unknown>;

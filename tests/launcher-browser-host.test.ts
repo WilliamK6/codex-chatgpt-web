@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createServer } from "node:http";
+import { createServer as createNetServer, type Socket } from "node:net";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import {
   LAUNCHER_BROWSER_HOST_KIND,
   LauncherRetainedConversationUnavailableError,
   LauncherBrowserTurnCancelledError,
+  connectLauncherDebugTransport,
   inspectLauncherBrowserHost,
   notifyLauncherTurn,
   readLauncherBrowserHostDescriptor,
@@ -16,6 +18,7 @@ import {
 import type { Browser, BrowserContext, Page } from "playwright-core";
 
 const roots: string[] = [];
+const DEBUG_LEASE_TOKEN = "debug-lease-token-0123456789abcdefghijklmnopqr";
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -24,16 +27,20 @@ afterEach(() => {
 function descriptorFile(
   controlEndpoint = "http://127.0.0.1:39111",
   profile: "production" | "development" = "production",
+  debugEndpoint = "tcp://127.0.0.1:39110",
 ): string {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-descriptor-"));
   roots.push(root);
   const path = join(root, "launcher-browser.json");
   writeFileSync(path, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39110",
+    debug: {
+      endpoint: debugEndpoint,
+      token: "launcher-debug-token-0123456789abcdefghijklmnopqr",
+    },
     control: {
       endpoint: controlEndpoint,
       token: "launcher-control-token-0123456789abcdefghijklmnop",
@@ -52,18 +59,149 @@ function descriptorFile(
   return path;
 }
 
+function framed(value: object): Buffer {
+  const body = Buffer.from(JSON.stringify(value));
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(body.length);
+  return Buffer.concat([header, body]);
+}
+
 test("launcher descriptor is owner-only, loopback-only, and process-bound", () => {
   const path = descriptorFile();
   expect(readLauncherBrowserHostDescriptor(path)).toMatchObject({
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: "production",
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39110",
+    debug: {
+      endpoint: "tcp://127.0.0.1:39110",
+      token: "launcher-debug-token-0123456789abcdefghijklmnopqr",
+    },
     surfaceId: "launcher_surface_id_0123456789AB",
   });
   if (process.platform !== "win32") {
     chmodSync(path, 0o644);
     expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("unsafe permissions");
+  }
+});
+
+test("launcher private debug transport authenticates before carrying CDP messages", async () => {
+  const received: unknown[] = [];
+  const server = createNetServer(socket => {
+    let buffer = Buffer.alloc(0);
+    socket.on("data", chunk => {
+      buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+      while (buffer.length >= 4) {
+        const length = buffer.readUInt32BE(0);
+        if (buffer.length < 4 + length) return;
+        const message = JSON.parse(buffer.subarray(4, 4 + length).toString("utf8"));
+        buffer = buffer.subarray(4 + length);
+        received.push(message);
+        if (message.type === "authenticate") socket.write(framed({ type: "ready" }));
+        if (message.type === "cdp") {
+          socket.write(framed({
+            type: "cdp",
+            message: { id: message.message.id, result: { product: "private" } },
+          }));
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const descriptor = readLauncherBrowserHostDescriptor(descriptorFile(
+      "http://127.0.0.1:39111",
+      "production",
+      `tcp://127.0.0.1:${address.port}`,
+    ));
+    const transport = await connectLauncherDebugTransport(
+      descriptor,
+      descriptor.surfaceId,
+      DEBUG_LEASE_TOKEN,
+      2_000,
+    );
+    const response = new Promise<object>(resolve => { transport.onmessage = resolve; });
+    transport.send({ id: 7, method: "Browser.getVersion", params: {} });
+    await expect(response).resolves.toEqual({ id: 7, result: { product: "private" } });
+    expect(received[0]).toEqual({
+      type: "authenticate",
+      token: descriptor.debug.token,
+      surfaceId: descriptor.surfaceId,
+      helperPid: process.pid,
+      leaseToken: DEBUG_LEASE_TOKEN,
+    });
+    expect(received[1]).toEqual({
+      type: "cdp",
+      message: { id: 7, method: "Browser.getVersion", params: {} },
+    });
+    transport.close();
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher private debug transport fails promptly on malformed framing and abort", async () => {
+  const malformedSockets = new Set<Socket>();
+  const malformed = createNetServer(socket => {
+    malformedSockets.add(socket);
+    socket.once("close", () => malformedSockets.delete(socket));
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(0);
+    socket.write(header);
+  });
+  await new Promise<void>((resolve, reject) => {
+    malformed.once("error", reject);
+    malformed.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = malformed.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const descriptor = readLauncherBrowserHostDescriptor(descriptorFile(
+      "http://127.0.0.1:39111",
+      "production",
+      `tcp://127.0.0.1:${address.port}`,
+    ));
+    await expect(connectLauncherDebugTransport(descriptor, descriptor.surfaceId, DEBUG_LEASE_TOKEN, 2_000))
+      .rejects.toThrow("private debug frame is too large");
+  } finally {
+    for (const socket of malformedSockets) socket.destroy();
+    await new Promise<void>(resolve => malformed.close(() => resolve()));
+  }
+
+  const stalledSockets = new Set<Socket>();
+  const stalled = createNetServer(socket => {
+    stalledSockets.add(socket);
+    socket.once("close", () => stalledSockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    stalled.once("error", reject);
+    stalled.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = stalled.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const descriptor = readLauncherBrowserHostDescriptor(descriptorFile(
+      "http://127.0.0.1:39111",
+      "production",
+      `tcp://127.0.0.1:${address.port}`,
+    ));
+    const controller = new AbortController();
+    const pending = connectLauncherDebugTransport(
+      descriptor,
+      descriptor.surfaceId,
+      DEBUG_LEASE_TOKEN,
+      2_000,
+      controller.signal,
+    );
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  } finally {
+    for (const socket of stalledSockets) socket.destroy();
+    await new Promise<void>(resolve => stalled.close(() => resolve()));
   }
 });
 
@@ -78,7 +216,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
     };
     response.writeHead(200, { "content-type": "application/json" });
     response.end(request.url === "/v1/turn/start"
-      ? '{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","reused":true,"connectorBound":true}\n'
+      ? `{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","debugLeaseToken":"${DEBUG_LEASE_TOKEN}","reused":true,"connectorBound":true}\n`
       : request.url === "/v1/turn/end"
         ? '{"ok":true,"cancelledByUser":false}\n'
         : '{"ok":true}\n');
@@ -100,6 +238,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       requireRetainedConversation: true,
     })).resolves.toEqual({
       surfaceId: "launcher_surface_id_0123456789AB",
+      debugLeaseToken: DEBUG_LEASE_TOKEN,
       reused: true,
       connectorBound: true,
     });
@@ -288,9 +427,9 @@ test("launcher session verification reports its own deadline instead of a generi
 test("launcher descriptor rejects non-loopback browser ownership", () => {
   const path = descriptorFile();
   const value = JSON.parse(readFileSync(path, "utf8"));
-  value.endpoint = "https://example.com:443";
+  value.debug.endpoint = "tcp://0.0.0.0:443";
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("http://127.0.0.1");
+  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("tcp://127.0.0.1");
 });
 
 test("launcher profile checks reject cross-profile browser ownership", async () => {

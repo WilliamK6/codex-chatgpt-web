@@ -149,6 +149,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
   const descriptorPath = join(devHome, "runtime", "launcher-browser.json");
   const helperScript = join(root, "helper.cjs");
   const controlToken = "dev-launcher-control-token-0123456789abcdefghijklmnop";
+  const debugToken = "dev-launcher-debug-token-0123456789abcdefghijklmnopq";
   let inspections = 0;
   const control = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -176,11 +177,11 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     mkdirSync(join(devHome, "runtime"), { recursive: true });
     writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
     writeFileSync(descriptorPath, `${JSON.stringify({
-      version: 2,
+      version: 3,
       kind: "codex-web-gpt-launcher",
       profile: "development",
       pid: process.pid,
-      endpoint: "http://127.0.0.1:48121",
+      debug: { endpoint: "tcp://127.0.0.1:48121", token: debugToken },
       control: { endpoint: `http://127.0.0.1:${address.port}`, token: controlToken },
       helper: { executable: process.execPath, script: helperScript },
       partition: "persist:codex-web-gpt-dev-chatgpt",
@@ -207,7 +208,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     expect(result.stdout).toContain("DEV launcher owns the isolated MCP tunnel");
     expect(inspections).toBe(1);
     expect(JSON.parse(readFileSync(join(devHome, "config.json"), "utf8"))).toMatchObject({
-      version: 3,
+      version: 4,
       purpose: "dev-harness",
       mode: "browser-only",
       appName: "Codex Native2 DEV",
@@ -230,7 +231,7 @@ test("terminal uninstall refuses to race a launcher-owned runtime", async () => 
   const configPath = join(appHome, "config.json");
   mkdirSync(appHome, { recursive: true });
   writeFileSync(configPath, `${JSON.stringify({
-    version: 3,
+    version: 4,
     releaseVersion: "0.2.0",
     mode: "browser-only",
     host: "127.0.0.1",
@@ -246,6 +247,7 @@ test("terminal uninstall refuses to race a launcher-owned runtime", async () => 
     proAvailable: false,
     autoApproveToolCalls: false,
     controlToken: "launcher-uninstall-control-token-0123456789abcdef",
+    responsesToken: "launcher-uninstall-responses-token-0123456789abcdef",
     runtimeCommand: [process.execPath],
   })}\n`);
   try {
@@ -273,17 +275,18 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
   const helperScript = join(root, "helper.cjs");
   const runtimeKeyFile = join(appHome, "secrets", "runtime.key");
   const token = "launcher-uninstall-control-token-0123456789abcdef";
+  const debugToken = "launcher-uninstall-debug-token-0123456789abcdefg";
   mkdirSync(join(appHome, "runtime"), { recursive: true });
   mkdirSync(join(appHome, "secrets"), { recursive: true });
   mkdirSync(codexHome, { recursive: true });
   writeFileSync(helperScript, "module.exports = {};\n");
   writeFileSync(runtimeKeyFile, "test-key\n");
   writeFileSync(descriptorPath, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: "codex-web-gpt-launcher",
     profile: "production",
     pid: process.pid,
-    endpoint: "http://127.0.0.1:48111",
+    debug: { endpoint: "tcp://127.0.0.1:48111", token: debugToken },
     control: { endpoint: "http://127.0.0.1:48112", token },
     helper: { executable: process.execPath, script: helperScript },
     partition: "persist:codex-web-gpt-chatgpt",
@@ -292,7 +295,7 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   writeFileSync(join(appHome, "config.json"), `${JSON.stringify({
-    version: 3,
+    version: 4,
     releaseVersion: "0.2.0",
     mode: "full",
     host: "127.0.0.1",
@@ -308,6 +311,7 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
     proAvailable: false,
     autoApproveToolCalls: false,
     controlToken: "runtime-control-token-0123456789abcdef0123456789",
+    responsesToken: "runtime-responses-token-0123456789abcdef0123456789",
     runtimeCommand: [process.execPath],
     tunnel: {
       binaryPath: join(root, "missing-tunnel-client"),

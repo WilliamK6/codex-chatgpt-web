@@ -62,7 +62,7 @@ export interface TunnelConfig {
 }
 
 export interface AppConfig {
-  version: 3;
+  version: 4;
   purpose?: "dev-harness";
   releaseVersion: string;
   mode: RuntimeMode;
@@ -82,6 +82,7 @@ export interface AppConfig {
   experimentalBiggerContext: boolean;
   autoApproveToolCalls: boolean;
   controlToken: string;
+  responsesToken: string;
   runtimeCommand: string[];
   acknowledgedUnofficialAt?: string;
   tunnel?: TunnelConfig;
@@ -162,10 +163,18 @@ export function preserveUtf8Bom(text: string, original: string): string {
   return original.startsWith("\uFEFF") ? `\uFEFF${stripUtf8Bom(text)}` : stripUtf8Bom(text);
 }
 
+export function randomCapabilityToken(excluded?: unknown): string {
+  let token: string;
+  do token = randomBytes(32).toString("base64url");
+  while (token === excluded);
+  return token;
+}
+
 export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
   const home = getConfigDir();
+  const controlToken = randomCapabilityToken();
   return {
-    version: 3,
+    version: 4,
     releaseVersion: VERSION,
     mode,
     subagentProtocol: "compatibility-v1",
@@ -182,7 +191,8 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     proAvailable: false,
     experimentalBiggerContext: false,
     autoApproveToolCalls: false,
-    controlToken: randomBytes(32).toString("base64url"),
+    controlToken,
+    responsesToken: randomCapabilityToken(controlToken),
     runtimeCommand: currentRuntimeCommand(),
   };
 }
@@ -309,25 +319,41 @@ export function loadConfig(): AppConfig {
   return parseConfig(JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))), path);
 }
 
+const migratedSetupConfigs = new WeakSet<AppConfig>();
+
+export function configWasMigratedForSetup(config: AppConfig): boolean {
+  return migratedSetupConfigs.has(config);
+}
+
 export function loadConfigForSetup(): AppConfig {
   const path = getConfigPath();
   if (!existsSync(path)) throw new Error(`Configuration is missing: ${path}. Run codex-chatgpt-web setup first.`);
   const raw = JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))) as Record<string, unknown>;
+  let migrated = false;
   if (raw.version === 1 && raw.mode === "pro-only") {
     raw.version = 2;
     raw.mode = "browser-only";
+    migrated = true;
   }
   if (raw.version === 2) {
     raw.version = 3;
     raw.browserHost = "managed-chrome";
+    migrated = true;
   }
-  return parseConfig(raw, path);
+  if (raw.version === 3) {
+    raw.version = 4;
+    raw.responsesToken = randomCapabilityToken(raw.controlToken);
+    migrated = true;
+  }
+  const config = parseConfig(raw, path);
+  if (migrated) migratedSetupConfigs.add(config);
+  return config;
 }
 
 function parseConfig(value: unknown, path: string): AppConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid configuration object in ${path}`);
   const parsed = value as Partial<AppConfig>;
-  if (parsed.version !== 3) throw new Error(`Unsupported configuration version in ${path}; rerun setup to migrate it`);
+  if (parsed.version !== 4) throw new Error(`Unsupported configuration version in ${path}; rerun setup to migrate it`);
   if (parsed.purpose !== undefined && parsed.purpose !== "dev-harness") {
     throw new Error(`Invalid configuration purpose in ${path}`);
   }
@@ -350,7 +376,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid autoApproveToolCalls in ${path}`);
   }
   const requiredStrings: Array<keyof AppConfig> = [
-    "appName", "chromeExecutablePath", "storageStatePath", "brokerSocketPath", "controlToken",
+    "appName", "chromeExecutablePath", "storageStatePath", "brokerSocketPath", "controlToken", "responsesToken",
   ];
   for (const key of requiredStrings) {
     if (typeof parsed[key] !== "string" || !(parsed[key] as string).trim()) throw new Error(`Missing ${key} in ${path}`);
@@ -373,6 +399,10 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`brokerSocketPath must be an absolute Unix socket path in ${path}`);
   }
   if (!/^[A-Za-z0-9_-]{40,}$/.test(parsed.controlToken!)) throw new Error(`Invalid controlToken in ${path}`);
+  if (!/^[A-Za-z0-9_-]{40,}$/.test(parsed.responsesToken!)) throw new Error(`Invalid responsesToken in ${path}`);
+  if (parsed.responsesToken === parsed.controlToken) {
+    throw new Error(`responsesToken must differ from controlToken in ${path}`);
+  }
   if (parsed.mode === "full") {
     if (!parsed.tunnel || typeof parsed.tunnel !== "object") throw new Error("Full mode requires tunnel configuration");
     for (const key of ["binaryPath", "tunnelId", "runtimeKeyFile", "profileDir", "profileName", "alias"] as const) {
@@ -426,8 +456,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
 
 export function saveConfig(config: AppConfig): void {
   const path = getConfigPath();
+  const validated = parseConfig(config, path);
   const original = existsSync(path) ? readFileSync(path, "utf8") : "";
-  atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(config, null, 2)}\n`, original));
+  atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(validated, null, 2)}\n`, original));
 }
 
 export function providerConfig(config: AppConfig): CodexProviderConfig {

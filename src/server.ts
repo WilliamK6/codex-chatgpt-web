@@ -40,6 +40,26 @@ import { VERSION } from "./version";
 
 type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified";
 
+function capabilityMatches(expected: string, supplied: string): boolean {
+  const wanted = Buffer.from(expected);
+  const actual = Buffer.from(supplied);
+  return wanted.length === actual.length && timingSafeEqual(wanted, actual);
+}
+
+/**
+ * Returns the logical `/v1/...` path for a valid local capability, `null` for a functional
+ * Responses path with a missing/wrong capability, and `undefined` for unrelated paths.
+ */
+export function authenticatedResponsesPath(
+  pathname: string,
+  responsesToken: string,
+): string | null | undefined {
+  if (pathname === "/v1" || pathname.startsWith("/v1/")) return null;
+  const match = /^\/([^/]+)(\/v1(?:\/.*)?)$/.exec(pathname);
+  if (!match) return undefined;
+  return capabilityMatches(responsesToken, match[1]!) ? match[2]! : null;
+}
+
 export interface HttpStreamFailureEvidence {
   httpTurnId: number;
   endpoint: HttpTrackedEndpoint;
@@ -734,7 +754,10 @@ export function startServer(
         setTimeout(shutdown, 0);
         return Response.json({ status: "ok", accepting_turns: false, ...current });
       }
-      if (req.method === "GET" && url.pathname === "/v1/models") {
+      const routePath = authenticatedResponsesPath(url.pathname, config.responsesToken);
+      if (routePath === null) return new Response("Not found", { status: 404 });
+      if (routePath === undefined) return new Response("Not found", { status: 404 });
+      if (req.method === "GET" && routePath === "/v1/models") {
         if (draining) {
           return formatErrorResponse(
             503,
@@ -769,13 +792,13 @@ export function startServer(
           return response;
         }, req.signal, process.platform, "models");
       }
-      if (req.method === "GET" && url.pathname === "/v1/responses") {
+      if (req.method === "GET" && routePath === "/v1/responses") {
         return new Response("Responses WebSocket transport is not enabled on this local route", {
           status: 426,
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
       }
-      if (req.method === "POST" && url.pathname === "/v1/responses") {
+      if (req.method === "POST" && routePath === "/v1/responses") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => responseRequest(new Request(req, { signal }), config),
@@ -784,7 +807,7 @@ export function startServer(
           "responses",
         );
       }
-      if (req.method === "POST" && url.pathname === "/v1/responses/compact") {
+      if (req.method === "POST" && routePath === "/v1/responses/compact") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => compactRequest(new Request(req, { signal }), config),
@@ -793,7 +816,7 @@ export function startServer(
           "compact",
         );
       }
-      if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
+      if (req.method === "POST" && routePath === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),

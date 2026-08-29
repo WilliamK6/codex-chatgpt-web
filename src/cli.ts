@@ -420,7 +420,7 @@ async function main(): Promise<void> {
     assertNoArgs(args);
     const config = loadConfig();
     const server = startServer(config);
-    stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);
+    stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port} (${config.mode})\n`);
     await new Promise<void>(() => {});
   } else if (command === "dev") await runDevCommand(args);
   else if (command === "mcp") await runChatGptMcpMain(args);

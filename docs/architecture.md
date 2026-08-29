@@ -2,7 +2,7 @@
 
 ```text
 Codex app / CLI
-      │ Responses API on loopback
+      │ capability-bearing Responses API on loopback
       ▼
 launcher-owned codex-chatgpt-web daemon
   ├─ official /models passthrough + fixed ChatGPT Web models
@@ -65,6 +65,10 @@ probe. The DEV launcher supervisor owns only the isolated MCP tunnel. Browser di
 state, thread authority, checkpoints, and named chat state live
 under `~/.codex-chatgpt-web-dev` by default.
 
+Because the repository DEV driver invokes the in-process handlers directly, it never binds a
+Responses or health listener and never installs a capability-bearing `openai_base_url`. Its private
+Electron debug broker is scoped to the DEV launcher's own profile and surfaces.
+
 The ChatGPT connector name is also the public MCP ABI identity. The direct turn-token contract uses
 `Codex Native2`; the retired `Codex Native` identity is never selected or refreshed in place. Setup
 migrates known legacy local configuration to the new name, clears prior verification state, and
@@ -93,6 +97,14 @@ redirected to another browser. After the provider returns to ChatGPT, the launch
 server-authenticated session and the Temporary Chat composer in the primary owned view, then closes
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
+
+Electron is not launched with Chromium's `remote-debugging-port` or target-discovery switches. A
+private, length-bounded loopback broker authenticates each browser helper with an independent random
+operation/turn capability that is not stored in the launcher descriptor before attaching Electron's
+in-process debugger. The launcher then authorizes only the exact home or task surface leased to that
+live helper PID and revalidates that lease before every CDP command. The broker supplies the narrow
+CDP subset needed by Playwright, rejects browser-wide target, cookie, storage, service-worker, and
+tracing operations, and revokes the attachment when the lease ends or is reassigned.
 
 The current compiled Codex task context is inserted as one inline JSON envelope. Image bytes stay
 out of the JSON and are attached natively with stable references. The runtime does not create a
@@ -141,7 +153,11 @@ removed during an explicit launcher migration; launchd remains only for the adva
 mode.
 
 Setup keeps Codex's built-in `openai` provider; its only managed provider-routing assignment is
-`openai_base_url`. The daemon
+`openai_base_url`. That URL contains a random persistent path capability, for example
+`http://127.0.0.1:17841/<capability>/v1`. The Responses capability is generated independently from
+the lifecycle-control bearer, is checked before request-body or turn processing, and is redacted
+from launcher diagnostics. It is local secret material: the owner-only application config, managed
+Codex config, route journal, and rollback data must not be shared. The daemon
 forwards the authenticated official model catalog and appends only the routed models owned by the
 `chatgpt-web/` namespace; no static catalog is installed. Subagent protocol selection is explicit,
 and new installations default to Compatibility V1 because it is the only surface portable across
@@ -165,6 +181,12 @@ when a task starts, and its global `multi_agent_v2` override wins over per-model
 protocol therefore requires restarting Codex and starting a new task. Model choice, effort,
 context, and service tiers are otherwise unchanged.
 
+Upgrading an existing launcher configuration generates the Responses capability and commits the
+application config, managed Codex route, integration journal, and recovery journal as one
+compensating transaction. A failure restores the captured pre-migration files instead of leaving a
+mixed authenticated/unauthenticated route. After a successful install or migration, Codex must be
+restarted once (and a new task opened) so it reloads the capability-bearing `openai_base_url`.
+
 The built-in provider attempts a Responses WebSocket prewarm. The local route explicitly returns
 HTTP `426`, which is Codex's native capability-negotiation signal for an immediate, session-sticky
 switch to its HTTP/SSE transport. No model or provider fallback occurs.
@@ -186,7 +208,12 @@ launcher error.
 ## Security invariants
 
 - Bind the Responses proxy and health endpoint to loopback only.
-- Store browser state and tunnel credentials under the application home with mode `0600`.
+- Require a persistent, random path capability on every functional Responses route; keep `/healthz`
+  public on loopback and authenticate `/admin/*` with a distinct control bearer.
+- Store browser state, route capabilities, journals, and tunnel credentials under owner-only
+  application/Codex homes; secret files use mode `0600`.
+- Drive Electron through the authenticated private debug broker and never expose a raw Chromium
+  DevTools port or browser-wide target enumeration surface.
 - Protect lifecycle control endpoints with a random application-owned bearer token.
 - Never place secret values in command-line arguments, logs, generated profiles, or Git.
 - Limit browser turns to five independent task-bound tabs and reject unsupported models explicitly.

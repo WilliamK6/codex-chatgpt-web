@@ -45,7 +45,7 @@ async function localHealthServer(statusForPath = () => 200, bodyForPath = () => 
 function launcherConfig(descriptorPath, overrides = {}) {
   const root = path.dirname(descriptorPath);
   return {
-    version: 3,
+    version: 4,
     releaseVersion: "0.2.0",
     mode: "browser-only",
     host: "127.0.0.1",
@@ -63,6 +63,7 @@ function launcherConfig(descriptorPath, overrides = {}) {
     proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
+    responsesToken: "runtime-supervisor-responses-token-0123456789abcdef",
     runtimeCommand: [process.execPath],
     ...overrides,
   };
@@ -228,7 +229,7 @@ test("launcher runtime validation rejects a relative full-mode executable before
 test("launcher runtime validation accepts native Windows paths and a named pipe", () => {
   const descriptorPath = "C:\\Users\\Example\\AppData\\Local\\Codex Web GPT\\launcher-browser.json";
   const config = {
-    version: 3,
+    version: 4,
     releaseVersion: "0.2.0",
     mode: "browser-only",
     host: "127.0.0.1",
@@ -245,6 +246,7 @@ test("launcher runtime validation accepts native Windows paths and a named pipe"
     proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
+    responsesToken: "runtime-supervisor-responses-token-0123456789abcdef",
     runtimeCommand: ["C:\\Users\\Example\\.codex-chatgpt-web\\runtime\\bun.exe"],
   };
   assert.equal(validateConfig(config, descriptorPath, "win32"), config);

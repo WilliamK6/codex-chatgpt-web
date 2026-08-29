@@ -39,6 +39,7 @@ interface VerifyMessage {
   config: {
     appName: string;
     browserHostDescriptorPath: string;
+    debugLeaseToken: string;
   };
 }
 
@@ -266,7 +267,12 @@ function maintenanceWorker(message: MaintenanceMessage): ChatGptBrowserWorker {
   }
   const appName = message.config.appName?.trim();
   const browserHostDescriptorPath = message.config.browserHostDescriptorPath?.trim();
-  if (!appName || appName.length > 80 || !browserHostDescriptorPath) {
+  const debugLeaseToken = message.config.debugLeaseToken?.trim();
+  if (!appName
+    || appName.length > 80
+    || !browserHostDescriptorPath
+    || !debugLeaseToken
+    || !/^[A-Za-z0-9_-]{40,}$/.test(debugLeaseToken)) {
     throw new Error("Browser helper maintenance config is invalid");
   }
   const provider: CodexProviderConfig = {
@@ -274,7 +280,7 @@ function maintenanceWorker(message: MaintenanceMessage): ChatGptBrowserWorker {
     baseUrl: "https://chatgpt.com",
     chatgptWeb: { appName, browserHost: "launcher", browserHostDescriptorPath },
   };
-  return ChatGptBrowserWorker.forProvider(provider);
+  return ChatGptBrowserWorker.forProvider(provider, { debugLeaseToken });
 }
 
 async function maintain(message: InspectMessage | SmokeMessage): Promise<void> {

@@ -8,7 +8,8 @@ created. Repository contents, tool output, websites, and prompt text are untrust
 
 ## Full-mode capability flow
 
-1. The daemon accepts a Codex Responses turn on `127.0.0.1`.
+1. The daemon accepts a Codex Responses turn on `127.0.0.1` only when the request path contains the
+   persistent Responses capability installed in Codex's managed `openai_base_url`.
 2. It extracts `cwd`, workspace roots, sandbox policy, and the tool registry only from the native
    Codex wire envelope with matching turn metadata. A user-authored `<environment_context>` is not
    accepted as authority.
@@ -43,6 +44,15 @@ current OS user's private application-data directory and is never copied into a 
 runtime descriptor. Never sync, upload, attach, or commit it. On suspected exposure, sign out or
 revoke the ChatGPT session from the launcher.
 
+The launcher does not enable Electron/Chromium's raw remote-debugging port. Browser helpers instead
+authenticate to an application-owned, framed loopback broker with a separate random debug
+capability plus an operation/turn capability that never appears in the persistent descriptor. The
+broker resolves only the exact launcher surface leased to that helper process, revalidates the lease
+before each command, and revokes live attachments on completion, removal, or reassignment. It does
+not expose browser-wide target discovery, cookie mutation, storage access, or control. This keeps
+Playwright-based automation without publishing a generic DevTools endpoint to other local
+applications.
+
 ### Tunnel credential theft
 
 The runtime key needs only Tunnels Read + Use. It is accepted through a hidden prompt or copied
@@ -51,18 +61,32 @@ argument or generated profile. Rotate it after suspected exposure.
 
 ### Same-user local process
 
-The Responses endpoint is loopback-only, but it has no independent bearer secret because the
-built-in Codex OpenAI provider cannot be configured with a bridge-specific credential while
-preserving the native provider/task identity. Another process under the same OS user can reach the
-port. Run on a trusted single-user account and treat local code execution as inside the trust
-boundary.
+The Responses endpoint is loopback-only and every functional `/v1` route is below a random,
+persistent path capability. Setup installs that capability in the managed `openai_base_url`; it is
+distinct from the lifecycle-control bearer and the launcher's browser-debug capability. The daemon
+checks it before reading a request body, allocating turn state, or forwarding upstream. Native
+Codex `Authorization` headers remain untouched so official-model passthrough keeps the original
+provider and task identity.
 
-The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
-`/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
-user-only application config. The launcher uses them to reject new work, prove that both the HTTP
-request and long-lived browser/tool loop are idle, flush response state, and stop a process. The
-token does not turn loopback into a hostile-local-process security boundary; it prevents accidental
-or unauthenticated lifecycle control through ordinary requests.
+The capability prevents an ordinary unauthenticated local request from using the bridge, but it is
+not a boundary against arbitrary code already running as the same OS user. Such a process may be
+able to read the owner-only application config, Codex config, or browser profile and recover the
+capability or session. Run on a trusted single-user account, keep these files private, and treat
+same-UID code execution as inside the trust boundary.
+
+`/healthz` remains public on loopback so the launcher and doctor can determine readiness without
+receiving either secret. Lifecycle endpoints are separate from both health and Responses:
+`/admin/drain`, `/admin/resume`, `/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown`
+require the distinct random control bearer stored in the user-only application config. The launcher
+uses them to reject new work, prove that both the HTTP request and long-lived browser/tool loop are
+idle, flush response state, and stop a process. The token does not turn loopback into a
+hostile-same-UID security boundary; it prevents accidental or unauthenticated lifecycle control
+through ordinary requests.
+
+Never paste the Responses path capability, control bearer, browser-debug capability, or a complete
+managed `openai_base_url` into a chat, issue, terminal transcript, or diagnostic report. Logs and
+status output redact capability-bearing routes; local config, route journals, and their backups must
+retain owner-only permissions.
 
 ### Browser/UI drift
 
@@ -94,7 +118,10 @@ assistant prose as a structured handoff.
 
 ## Network exposure
 
-- Responses and health listeners bind to `127.0.0.1` only.
+- Responses and health listeners bind to `127.0.0.1` only. Functional Responses paths require the
+  persistent route capability, `/healthz` is public, and `/admin/*` uses the separate control bearer.
+- Browser automation uses the launcher's authenticated private debug broker on loopback; the app
+  does not publish Chromium's raw DevTools discovery/control port.
 - Full mode uses OpenAI's outbound HTTPS Secure MCP Tunnel; it opens no public listener or inbound
   firewall rule.
 - The embedded browser connects to ChatGPT, the selected identity provider during explicit sign-in,

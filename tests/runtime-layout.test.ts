@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assertDurableRuntimeCommand,
   CHATGPT_CONNECTOR_NAME,
+  configWasMigratedForSetup,
   DEV_CHATGPT_CONNECTOR_NAME,
   defaultBrokerEndpoint,
   defaultConfig,
@@ -18,6 +19,7 @@ import {
   resolveDevSetupConnectorName,
   resolveSetupConnectorName,
   runtimeCommandForProcess,
+  saveConfig,
 } from "../src/config";
 import { removeLegacyRuntimeArtifacts } from "../src/service";
 import { processRunning } from "../src/process";
@@ -106,7 +108,7 @@ test("the DEV profile uses a distinct connector identity without overwriting cus
   expect(resolveDevSetupConnectorName(undefined, "Explicit DEV Harness")).toBe("Explicit DEV Harness");
 });
 
-test("setup explicitly migrates v1 pro-only config to v3 managed browser-only", () => {
+test("setup explicitly migrates v1 pro-only config to v4 managed browser-only", () => {
   const root = join(tmpdir(), `codex-chatgpt-web-config-migration-${process.pid}-${Date.now()}`);
   roots.push(root);
   process.env.CODEX_CHATGPT_WEB_HOME = root;
@@ -130,13 +132,36 @@ test("setup explicitly migrates v1 pro-only config to v3 managed browser-only", 
   })}\n`);
 
   expect(() => loadConfig()).toThrow("rerun setup to migrate");
-  expect(loadConfigForSetup()).toMatchObject({
-    version: 3,
+  const migrated = loadConfigForSetup();
+  expect(migrated).toMatchObject({
+    version: 4,
     mode: "browser-only",
     browserHost: "managed-chrome",
     subagentProtocol: "compatibility-v1",
     solAvailable: true,
+    responsesToken: expect.stringMatching(/^[A-Za-z0-9_-]{40,}$/),
   });
+  expect(configWasMigratedForSetup(migrated)).toBe(true);
+  expect(migrated.responsesToken).not.toBe(migrated.controlToken);
+});
+
+test("runtime capabilities persist distinctly and invalid reuse is never saved", () => {
+  const root = join(tmpdir(), `codex-chatgpt-web-config-capabilities-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  const config = defaultConfig("browser-only");
+  expect(config.responsesToken).not.toBe(config.controlToken);
+
+  saveConfig(config);
+  expect(loadConfig()).toMatchObject({
+    controlToken: config.controlToken,
+    responsesToken: config.responsesToken,
+  });
+  const persisted = readFileSync(join(root, "config.json"), "utf8");
+
+  config.responsesToken = config.controlToken;
+  expect(() => saveConfig(config)).toThrow("responsesToken must differ from controlToken");
+  expect(readFileSync(join(root, "config.json"), "utf8")).toBe(persisted);
 });
 
 test("legacy temp-path wrapper and vendor are removed only after runtime ownership changes", () => {

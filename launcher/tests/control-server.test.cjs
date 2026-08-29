@@ -10,6 +10,7 @@ test("browser control server authenticates and owns turn visibility", async () =
       calls.push(["start", ...args]);
       return {
         surfaceId: "launcher_surface_id_0123456789AB",
+        debugLeaseToken: "debug-lease-token-0123456789abcdefghijklmnopqr",
         tabId: "tab-1",
         reused: false,
         connectorBound: false,
@@ -58,6 +59,14 @@ test("browser control server authenticates and owns turn visibility", async () =
       }),
     });
     assert.equal(start.status, 200);
+    assert.deepEqual(await start.json(), {
+      ok: true,
+      surfaceId: "launcher_surface_id_0123456789AB",
+      debugLeaseToken: "debug-lease-token-0123456789abcdefghijklmnopqr",
+      tabId: "tab-1",
+      reused: false,
+      connectorBound: false,
+    });
 
     const heartbeat = await fetch(`${descriptor.endpoint}/v1/turn/heartbeat`, {
       method: "POST",

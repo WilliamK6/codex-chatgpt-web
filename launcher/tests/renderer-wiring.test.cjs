@@ -48,9 +48,20 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
     /runtimeSupervisor\?\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/,
   );
   const persist = electronMain.indexOf("await browserHost?.persistSession()");
+  const debugClose = electronMain.indexOf("await browserDebug?.close()", persist);
   const destroy = electronMain.indexOf("browserHost?.destroy()", persist);
   assert.ok(persist >= 0, "shutdown must persist the ChatGPT session");
+  assert.ok(debugClose > persist, "shutdown must close the private debug broker after persistence");
+  assert.ok(destroy > debugClose, "browser views must close only after the private debug broker closes");
   assert.ok(destroy > persist, "browser views must close only after session persistence completes");
+});
+
+test("launcher browser automation uses only its authenticated private broker", () => {
+  assert.match(electronMain, /const \{ BrowserDebugServer \} = require\("\.\/browser-debug-server\.cjs"\)/);
+  assert.match(electronMain, /browserDebug = await new BrowserDebugServer\(/);
+  assert.match(electronMain, /debug:\s*browserDebug\.descriptor\(\)/);
+  assert.doesNotMatch(electronMain, /remote-debugging-(?:address|port)/);
+  assert.doesNotMatch(electronMain, /appendSwitch\(["']remote-debugging/);
 });
 
 test("DEV launcher exposes its profile and supervises only its Full-mode MCP runtime", () => {

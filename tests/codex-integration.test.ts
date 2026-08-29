@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   activateCodexIntegration,
+  commitCodexIntegrationAndConfig,
   deactivateCodexIntegration,
   getCodexHome,
   getCodexJournalPath,
@@ -19,20 +20,25 @@ import {
 } from "../src/codex-integration";
 import { defaultConfig, loadConfig, saveConfig } from "../src/config";
 import {
+  MANAGED_COMMENT,
   MANAGED_MULTI_AGENT_V2_LINE,
   managedAgentMaxDepthLine,
+  sha256,
 } from "../src/codex-integration-shared";
 
 const roots: string[] = [];
+const TEST_RESPONSES_TOKEN = "test-responses-token-0123456789abcdefghijklmnop";
 
 function nativeConfig(mode: "browser-only" | "full") {
   const config = defaultConfig(mode);
+  config.responsesToken = TEST_RESPONSES_TOKEN;
   config.subagentProtocol = "native";
   return config;
 }
 
 function compatibilityV1Config(mode: "browser-only" | "full") {
   const config = defaultConfig(mode);
+  config.responsesToken = TEST_RESPONSES_TOKEN;
   config.subagentProtocol = "compatibility-v1";
   return config;
 }
@@ -85,7 +91,7 @@ describe("reversible native Codex route integration", () => {
     const journal = installCodexIntegration(nativeConfig("browser-only"));
     const installed = readFileSync(configPath, "utf8");
     expect(journal.version).toBe(8);
-    expect(installed).toContain('openai_base_url = "http://127.0.0.1:17841/v1"');
+    expect(installed).toContain(`openai_base_url = "http://127.0.0.1:17841/${TEST_RESPONSES_TOKEN}/v1"`);
     expect(installed).not.toContain("remote_compaction_v2");
     expect(installed).toContain("multi_agent = false # user choice");
     expect(installed).not.toContain("multi_agent_v2");
@@ -122,7 +128,7 @@ describe("reversible native Codex route integration", () => {
     expect(installed).toContain("multi_agent = false # native choice");
     expect(installed).toContain("multi_agent_v2 = true # native choice");
     expect(journal.installed).toEqual({
-      openai_base_url: "http://127.0.0.1:17841/v1",
+      openai_base_url: `http://127.0.0.1:17841/${TEST_RESPONSES_TOKEN}/v1`,
       subagent_protocol: "native",
     });
 
@@ -144,7 +150,9 @@ describe("reversible native Codex route integration", () => {
     ].join("\n");
     writeFileSync(configPath, original);
 
-    const journal = installCodexIntegration(compatibilityV1Config("browser-only"));
+    const config = compatibilityV1Config("browser-only");
+    saveConfig(config);
+    const journal = installCodexIntegration(config);
     const installed = readFileSync(configPath, "utf8");
     expect(journal).toMatchObject({
       version: 8,
@@ -409,7 +417,7 @@ describe("reversible native Codex route integration", () => {
     expect(() => installCodexIntegration(config)).toThrow("--replace-codex-route");
     installCodexIntegration(config, { replaceExistingRoute: true });
     const installed = readFileSync(configPath, "utf8");
-    expect(installed).toContain('openai_base_url = "http://127.0.0.1:17841/v1"');
+    expect(installed).toContain(`openai_base_url = "http://127.0.0.1:17841/${TEST_RESPONSES_TOKEN}/v1"`);
     expect(installed).toContain('model_provider = "existing-provider"');
     expect(installed).toContain('model_catalog_json = "/tmp/native.json"');
 
@@ -468,7 +476,8 @@ describe("reversible native Codex route integration", () => {
     const second = nativeConfig("browser-only");
     second.port = 17842;
     installCodexIntegration(second);
-    expect(readFileSync(configPath, "utf8")).toContain('openai_base_url = "http://127.0.0.1:17842/v1"');
+    expect(readFileSync(configPath, "utf8"))
+      .toContain(`openai_base_url = "http://127.0.0.1:17842/${TEST_RESPONSES_TOKEN}/v1"`);
     uninstallCodexIntegration();
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
   });
@@ -479,7 +488,9 @@ describe("reversible native Codex route integration", () => {
     const original = 'model = "gpt-5.6-sol"\napproval_policy = "never"\nopenai_base_url = "https://native.example/v1"\n';
     writeFileSync(configPath, original);
 
-    installCodexIntegration(nativeConfig("browser-only"), { replaceExistingRoute: true });
+    const config = nativeConfig("browser-only");
+    saveConfig(config);
+    installCodexIntegration(config, { replaceExistingRoute: true });
     expect(deactivateCodexIntegration()).toEqual({ changed: true, active: false });
     expect(readFileSync(configPath, "utf8")).toBe(original);
     expect(inspectCodexIntegration()).toMatchObject({ installed: true, active: false });
@@ -487,7 +498,7 @@ describe("reversible native Codex route integration", () => {
 
     expect(activateCodexIntegration()).toEqual({ changed: true, active: true });
     const reconnected = readFileSync(configPath, "utf8");
-    expect(reconnected).toContain('openai_base_url = "http://127.0.0.1:17841/v1"');
+    expect(reconnected).toContain(`openai_base_url = "http://127.0.0.1:17841/${TEST_RESPONSES_TOKEN}/v1"`);
     expect(reconnected).not.toContain("remote_compaction_v2");
     expect(reconnected).not.toContain("multi_agent");
     expect(reconnected).toContain('approval_policy = "never"');
@@ -496,6 +507,32 @@ describe("reversible native Codex route integration", () => {
 
     uninstallCodexIntegration();
     expect(readFileSync(configPath, "utf8")).toBe(original);
+  });
+
+  test("refuses to reconnect an authentic v8 journal with the legacy bare /v1 route", () => {
+    const { codexHome } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const original = 'model = "gpt-5.6-sol"\n';
+    writeFileSync(configPath, original);
+    const config = nativeConfig("browser-only");
+    saveConfig(config);
+    installCodexIntegration(config);
+    deactivateCodexIntegration();
+
+    const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
+    legacy.installed.openai_base_url = `http://127.0.0.1:${config.port}/v1`;
+    const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
+    writeFileSync(getCodexJournalPath(), legacyJournal);
+    writeFileSync(getCodexJournalRecoveryPath(), legacyJournal);
+    const before = [
+      configPath,
+      getCodexJournalPath(),
+      getCodexJournalRecoveryPath(),
+    ].map(path => [path, readFileSync(path)] as const);
+
+    expect(() => activateCodexIntegration())
+      .toThrow("route does not match the current application config; run Setup to migrate");
+    for (const [path, contents] of before) expect(readFileSync(path)).toEqual(contents);
   });
 
   test("keeps a disconnected bridge disabled across process-style journal reloads", () => {
@@ -511,6 +548,84 @@ describe("reversible native Codex route integration", () => {
     });
     expect(inspectCodexIntegration()).toMatchObject({ installed: true, active: false, errors: [] });
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
+  });
+
+  test("rolls back the route and journals when the matching app config cannot commit", () => {
+    const { codexHome, appHome } = fixture();
+    const codexConfigPath = join(codexHome, "config.toml");
+    writeFileSync(codexConfigPath, 'model = "gpt-5.6-sol"\n');
+    const config = compatibilityV1Config("browser-only");
+    saveConfig(config);
+    installCodexIntegration(config);
+    const before = [
+      join(appHome, "config.json"),
+      codexConfigPath,
+      getCodexJournalPath(),
+      getCodexJournalRecoveryPath(),
+    ].map(path => [path, readFileSync(path)] as const);
+
+    const invalid = { ...config, responsesToken: config.controlToken };
+    expect(() => commitCodexIntegrationAndConfig(invalid))
+      .toThrow("responsesToken must differ from controlToken");
+    for (const [path, contents] of before) expect(readFileSync(path)).toEqual(contents);
+  });
+
+  test("restores a deleted legacy v2 catalog when the route/config commit fails", () => {
+    const { codexHome, appHome } = fixture();
+    const codexConfigPath = join(codexHome, "config.toml");
+    const catalogPath = join(codexHome, "legacy-models.json");
+    const catalog = '{"models":["legacy-web"]}\n';
+    const providerBlock = [
+      "",
+      "[model_providers.codex-chatgpt-web]",
+      'name = "codex-chatgpt-web"',
+      'base_url = "http://127.0.0.1:17841/v1"',
+      'wire_api = "responses"',
+      "",
+    ].join("\n");
+    const legacyConfig = [
+      MANAGED_COMMENT,
+      'model_provider = "codex-chatgpt-web"',
+      `model_catalog_json = "${catalogPath}"`,
+      providerBlock,
+    ].join("\n");
+    writeFileSync(codexConfigPath, legacyConfig);
+    writeFileSync(catalogPath, catalog);
+    writeFileSync(getCodexModelsCachePath(), '{"models":["cached"]}\n');
+    const legacyJournal = `${JSON.stringify({
+      version: 2,
+      configPath: codexConfigPath,
+      catalogPath,
+      catalogSha256: sha256(catalog),
+      providerBlock,
+      installed: {
+        model_provider: "codex-chatgpt-web",
+        model_catalog_json: catalogPath,
+      },
+      previous: {
+        model_provider: { present: false },
+        model_catalog_json: { present: false },
+      },
+    }, null, 2)}\n`;
+    mkdirSync(join(appHome, "codex"), { recursive: true });
+    writeFileSync(getCodexJournalPath(), legacyJournal);
+    writeFileSync(getCodexJournalRecoveryPath(), legacyJournal);
+
+    const config = compatibilityV1Config("browser-only");
+    saveConfig(config);
+    const before = [
+      join(appHome, "config.json"),
+      codexConfigPath,
+      catalogPath,
+      getCodexModelsCachePath(),
+      getCodexJournalPath(),
+      getCodexJournalRecoveryPath(),
+    ].map(path => [path, readFileSync(path)] as const);
+
+    const invalid = { ...config, responsesToken: config.controlToken };
+    expect(() => commitCodexIntegrationAndConfig(invalid))
+      .toThrow("responsesToken must differ from controlToken");
+    for (const [path, contents] of before) expect(readFileSync(path)).toEqual(contents);
   });
 
   test("upgrades an existing v3 route journal when it is disconnected for the first time", () => {

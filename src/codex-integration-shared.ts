@@ -205,7 +205,14 @@ export function getCodexJournalRecoveryPath(): string {
 }
 
 export function routeUrl(config: AppConfig): string {
-  return `http://${config.host}:${config.port}/v1`;
+  return `http://${config.host}:${config.port}/${config.responsesToken}/v1`;
+}
+
+export function redactRouteCapability(value: string): string {
+  return value.replace(
+    /(https?:\/\/127\.0\.0\.1:\d+\/)[A-Za-z0-9_-]{40,}(\/v1(?:\/[^\s"'`]*)?)/g,
+    "$1[redacted]$2",
+  );
 }
 
 export function sha256(value: string | Uint8Array): string {

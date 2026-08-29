@@ -1,14 +1,15 @@
 import { existsSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import type { AppConfig, RuntimeMode, SubagentProtocol } from "./config";
 import {
   currentRuntimeCommand,
+  configWasMigratedForSetup,
   defaultBrokerEndpoint,
   defaultConfig,
   getConfigPath,
   loadConfigForSetup,
+  randomCapabilityToken,
   resolveDevSetupConnectorName,
   resolveSetupConnectorName,
   saveConfig,
@@ -20,10 +21,12 @@ import {
   storedBrowserLoginCapabilities,
 } from "./browser-login";
 import {
-  installCodexIntegration,
+  commitCodexIntegrationAndConfig,
   preflightCodexIntegration,
   readCodexSubagentProtocol,
+  snapshotApplicationConfig,
 } from "./codex-integration";
+import { restoreFileSnapshot, type FileSnapshot } from "./codex-integration-shared";
 import { inspectLauncherBrowserHost } from "./launcher-browser-host";
 import {
   DEV_CONFIG_PURPOSE,
@@ -36,6 +39,7 @@ import {
   installService,
   removeLegacyRuntimeArtifacts,
   restartService,
+  stopService,
   uninstallService,
 } from "./service";
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
@@ -126,6 +130,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     experimentalBiggerContext: before.experimentalBiggerContext,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
+    responsesToken: before.responsesToken,
     runtimeCommand: before.runtimeCommand,
     tunnel: before.tunnel,
   }) !== JSON.stringify({
@@ -147,6 +152,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     experimentalBiggerContext: after.experimentalBiggerContext,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
+    responsesToken: after.responsesToken,
     runtimeCommand: after.runtimeCommand,
     tunnel: after.tunnel,
   });
@@ -306,8 +312,186 @@ async function bootstrapTunnelProfile(config: AppConfig): Promise<void> {
   if (bootstrapError) throw bootstrapError;
 }
 
+interface TerminalSetupRollbackOperations {
+  getServiceStatus: typeof getServiceStatus;
+  uninstallService: typeof uninstallService;
+  installService: typeof installService;
+  stopService: typeof stopService;
+  waitForProxy: typeof waitForProxy;
+  getTunnelServiceStatus: typeof getTunnelServiceStatus;
+  uninstallTunnelService: typeof uninstallTunnelService;
+  stopTunnel: typeof stopTunnel;
+  bootstrapTunnelProfile: typeof bootstrapTunnelProfile;
+  installTunnelService: typeof installTunnelService;
+  stopTunnelService: typeof stopTunnelService;
+  waitForTunnelReady: typeof waitForTunnelReady;
+  restoreApplicationConfig: (snapshot: FileSnapshot) => void;
+}
+
+const terminalSetupRollbackOperations: TerminalSetupRollbackOperations = {
+  getServiceStatus,
+  uninstallService,
+  installService,
+  stopService,
+  waitForProxy,
+  getTunnelServiceStatus,
+  uninstallTunnelService,
+  stopTunnel,
+  bootstrapTunnelProfile,
+  installTunnelService,
+  stopTunnelService,
+  waitForTunnelReady,
+  restoreApplicationConfig: restoreFileSnapshot,
+};
+
+/**
+ * Restore the terminal-owned runtime after setup has changed its on-disk config or launchd
+ * services but has not committed the matching Codex route. Candidate runtimes are stopped while
+ * their capability is still on disk; only then is the previous config restored and its services
+ * explicitly reinstalled.
+ */
+export async function restoreTerminalSetupAfterFailure(
+  state: {
+    existing: AppConfig | undefined;
+    candidate: AppConfig;
+    priorConfigSnapshot: FileSnapshot;
+    beforeService: ReturnType<typeof getServiceStatus>;
+    beforeTunnelService: ReturnType<typeof getTunnelServiceStatus>;
+    candidateServiceStarted: boolean;
+    tunnelMutationStarted: boolean;
+  },
+  operations: TerminalSetupRollbackOperations = terminalSetupRollbackOperations,
+): Promise<void> {
+  const failures: string[] = [];
+  const attempt = async (label: string, action: () => unknown | Promise<unknown>): Promise<boolean> => {
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  };
+
+  // If restart never completed and the old service is still loaded, keep it alive. Otherwise,
+  // remove the candidate definition/runtime before replacing the capability-bearing app config.
+  let responseRuntimeStopped = true;
+  try {
+    const current = operations.getServiceStatus();
+    const currentIsCandidateOrPartial = state.candidateServiceStarted
+      || (!state.beforeService.loaded && (current.installed || current.loaded))
+      || (state.beforeService.loaded && !current.loaded && current.installed);
+    if (currentIsCandidateOrPartial) {
+      responseRuntimeStopped = await attempt(
+        "stop candidate Responses service",
+        () => operations.uninstallService(
+          state.candidateServiceStarted ? state.candidate : (state.existing ?? state.candidate),
+        ),
+      );
+    }
+  } catch (error) {
+    responseRuntimeStopped = false;
+    failures.push(`inspect candidate Responses service: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  let tunnelRuntimeStopped = true;
+  if (state.tunnelMutationStarted) {
+    try {
+      const current = operations.getTunnelServiceStatus();
+      if (current.installed || current.loaded) {
+        tunnelRuntimeStopped = await attempt(
+          "stop candidate tunnel service",
+          () => operations.uninstallTunnelService(),
+        );
+      }
+    } catch (error) {
+      tunnelRuntimeStopped = false;
+      failures.push(`inspect candidate tunnel service: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (state.candidate.mode === "full") {
+      const stopped = await attempt(
+        "stop candidate tunnel runtime",
+        () => operations.stopTunnel(state.candidate),
+      );
+      tunnelRuntimeStopped = tunnelRuntimeStopped && stopped;
+    }
+  }
+
+  if (!responseRuntimeStopped || !tunnelRuntimeStopped) {
+    throw new Error(failures.join("; "));
+  }
+
+  const configRestored = await attempt(
+    "restore previous application config",
+    () => operations.restoreApplicationConfig(state.priorConfigSnapshot),
+  );
+  if (!configRestored) throw new Error(failures.join("; "));
+
+  let previousServiceInstalled = true;
+  if (state.beforeService.installed || state.beforeService.loaded) {
+    if (!state.existing) {
+      failures.push("restore previous Responses service: previous application config is unavailable");
+      previousServiceInstalled = false;
+    } else {
+      previousServiceInstalled = await attempt(
+        "restore previous Responses service",
+        () => operations.installService(state.existing!),
+      );
+      if (previousServiceInstalled) {
+        await attempt(
+          "verify previous Responses service",
+          () => operations.waitForProxy(state.existing!),
+        );
+      }
+    }
+  }
+
+  let tunnelProfileRestored = true;
+  if (state.tunnelMutationStarted && state.existing?.mode === "full") {
+    tunnelProfileRestored = await attempt(
+      "restore previous tunnel profile",
+      () => operations.bootstrapTunnelProfile(state.existing!),
+    );
+  }
+
+  let previousTunnelServiceInstalled = true;
+  if (state.beforeTunnelService.installed || state.beforeTunnelService.loaded) {
+    if (state.existing?.mode !== "full" || !tunnelProfileRestored) {
+      failures.push("restore previous tunnel service: previous full-mode profile is unavailable");
+      previousTunnelServiceInstalled = false;
+    } else {
+      previousTunnelServiceInstalled = await attempt(
+        "restore previous tunnel service",
+        () => operations.installTunnelService(state.existing!),
+      );
+      if (previousTunnelServiceInstalled) {
+        await attempt("verify previous tunnel service", async () => {
+          const status = await operations.waitForTunnelReady(state.existing!);
+          if (!status.ok) throw new Error(status.detail);
+        });
+      }
+    }
+  }
+
+  // install* intentionally starts launchd jobs. Return jobs that were previously installed but
+  // unloaded to that exact state only after all dependent recovery checks have completed.
+  if (previousTunnelServiceInstalled && state.beforeTunnelService.installed && !state.beforeTunnelService.loaded) {
+    await attempt("restore previous tunnel service unloaded state", () => operations.stopTunnelService());
+  }
+  if (previousServiceInstalled && state.beforeService.installed && !state.beforeService.loaded && state.existing) {
+    await attempt(
+      "restore previous Responses service unloaded state",
+      () => operations.stopService(state.existing!),
+    );
+  }
+
+  if (failures.length > 0) throw new Error(failures.join("; "));
+}
+
 export async function setup(options: SetupOptions): Promise<SetupResult> {
+  const priorConfigSnapshot = snapshotApplicationConfig();
   const existing = loadExistingConfig();
+  const configMigrationRequired = existing ? configWasMigratedForSetup(existing) : false;
   if (existing?.purpose === DEV_CONFIG_PURPOSE) {
     throw new Error("A DEV harness configuration cannot be installed into Codex");
   }
@@ -328,8 +512,11 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     replaceExistingRoute: options.replaceCodexRoute,
   });
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
-  if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
+  if (existing && options.restartService) {
+    config.controlToken = randomCapabilityToken(config.responsesToken);
+  }
   const beforeService = getServiceStatus();
+  const beforeTunnelService = getTunnelServiceStatus();
   if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
     if (!existing) {
       throw new Error("A legacy background service exists without a verifiable configuration; refusing automatic migration");
@@ -341,8 +528,17 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       );
     }
   }
-  if (beforeService.loaded && !existing) {
-    throw new Error("A codex-chatgpt-web service is loaded but its configuration is missing; refusing to replace an unverifiable process");
+  if ((beforeService.installed || beforeService.loaded) && !existing) {
+    throw new Error("A codex-chatgpt-web service exists but its configuration is missing; refusing to replace an unverifiable service");
+  }
+  if (beforeService.loaded && !beforeService.installed) {
+    throw new Error("The codex-chatgpt-web service is loaded without its launchd definition; refusing a non-restorable setup change");
+  }
+  if ((beforeTunnelService.installed || beforeTunnelService.loaded) && existing?.mode !== "full") {
+    throw new Error("A tunnel service exists without a matching full-mode configuration; refusing to replace an unverifiable service");
+  }
+  if (beforeTunnelService.loaded && !beforeTunnelService.installed) {
+    throw new Error("The tunnel service is loaded without its launchd definition; refusing a non-restorable setup change");
   }
 
   let loginCreated = false;
@@ -388,7 +584,12 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   config.solAvailable = solAvailable === true;
   config.proAvailable = config.solAvailable && proAvailable === true;
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
-  const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
+  const preliminaryChange = Boolean(existing && (
+    configMigrationRequired
+    || meaningfulRuntimeChange(existing, config)
+    || explicitTunnelChange
+    || options.forceLogin
+  ));
   if (beforeService.loaded && preliminaryChange && !options.restartService) {
     throw new Error(
       "The daemon is currently serving a Codex task and setup would change its runtime. "
@@ -398,7 +599,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (beforeService.loaded && preliminaryChange && existing) await assertServiceIdle(existing);
   await configureTunnel(config, existing, options);
 
-  const changedWhileLoaded = Boolean(existing && beforeService.loaded && meaningfulRuntimeChange(existing, config));
+  const changedWhileLoaded = Boolean(existing && beforeService.loaded && (
+    configMigrationRequired || meaningfulRuntimeChange(existing, config)
+  ));
   if (changedWhileLoaded && !options.restartService) {
     throw new Error(
       "The daemon is currently serving a Codex task and setup would change its runtime. "
@@ -408,57 +611,96 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (changedWhileLoaded && !preliminaryChange && existing) await assertServiceIdle(existing);
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
-  if (!launcherOwned) {
-    saveConfig(config);
-    installService(config);
-    if (changedWhileLoaded && options.restartService && existing) await restartService(existing);
-    await waitForProxy(config);
+  let tunnelReady: boolean | null = null;
+  let candidateServiceStarted = false;
+  let tunnelMutationStarted = false;
+  try {
+    if (!launcherOwned) {
+      saveConfig(config);
+      const installed = installService(config);
+      candidateServiceStarted = !beforeService.loaded && installed.loaded;
+      if (changedWhileLoaded && options.restartService && existing) {
+        await restartService(existing);
+        candidateServiceStarted = true;
+      }
+      await waitForProxy(config);
+    }
+
+    if (config.mode === "browser-only" && existing?.mode === "full") {
+      tunnelMutationStarted = !launcherOwned;
+      const previousTunnelService = getTunnelServiceStatus();
+      if (previousTunnelService.installed || previousTunnelService.loaded) await uninstallTunnelService();
+      stopTunnel(existing);
+    }
+    if (config.mode === "full") {
+      const profilePath = join(config.tunnel!.profileDir, `${config.tunnel!.profileName}.yaml`);
+      const tunnelService = getTunnelServiceStatus();
+      const needsProfile = !existsSync(profilePath);
+      if (launcherOwned) {
+        if (tunnelService.installed || tunnelService.loaded) await uninstallTunnelService();
+        if (needsProfile || refreshTunnelWorker || explicitTunnelChange) {
+          await bootstrapTunnelProfile(config);
+        }
+      } else {
+        const needsOwnershipMigration = !tunnelService.installed || !tunnelService.loaded || !tunnelServiceDefinitionMatches(config);
+        if (needsOwnershipMigration || needsProfile) {
+          tunnelMutationStarted = true;
+          await assertServiceIdle(config);
+          if (tunnelService.loaded) await stopTunnelService();
+          await bootstrapTunnelProfile(config);
+          installTunnelService(config);
+        } else if (refreshTunnelWorker) {
+          tunnelMutationStarted = true;
+          await assertServiceIdle(config);
+          await restartTunnelService();
+        }
+        const status = await waitForTunnelReady(config);
+        if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);
+        tunnelReady = true;
+      }
+    }
+
+    if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
+      await uninstallService(existing!);
+    }
+
+    // A terminal commit must leave the candidate capability on disk if the Codex filesystem
+    // transaction fails. The outer compensation can then stop that candidate before restoring the
+    // true pre-setup snapshot. Launcher setup has its own supervisor checkpoint and keeps the
+    // original all-files snapshot here.
+    const commitConfigSnapshot = launcherOwned ? priorConfigSnapshot : snapshotApplicationConfig();
+    commitCodexIntegrationAndConfig(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    }, commitConfigSnapshot);
+  } catch (error) {
+    if (!launcherOwned) {
+      try {
+        await restoreTerminalSetupAfterFailure({
+          existing,
+          candidate: config,
+          priorConfigSnapshot,
+          beforeService,
+          beforeTunnelService,
+          candidateServiceStarted,
+          tunnelMutationStarted,
+        });
+      } catch (rollbackError) {
+        const primary = error instanceof Error ? error.message : String(error);
+        const rollback = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+        throw new Error(`${primary}; terminal setup rollback also failed: ${rollback}`);
+      }
+    }
+    throw error;
   }
 
-  let tunnelReady: boolean | null = null;
-  if (config.mode === "browser-only" && existing?.mode === "full") {
-    const previousTunnelService = getTunnelServiceStatus();
-    if (previousTunnelService.installed || previousTunnelService.loaded) await uninstallTunnelService();
-    stopTunnel(existing);
-  }
-  if (config.mode === "full") {
-    const profilePath = join(config.tunnel!.profileDir, `${config.tunnel!.profileName}.yaml`);
-    const tunnelService = getTunnelServiceStatus();
-    const needsProfile = !existsSync(profilePath);
-    if (launcherOwned) {
-      if (tunnelService.installed || tunnelService.loaded) await uninstallTunnelService();
-      if (needsProfile || refreshTunnelWorker || explicitTunnelChange) {
-        await bootstrapTunnelProfile(config);
-      }
-    } else {
-      const needsOwnershipMigration = !tunnelService.installed || !tunnelService.loaded || !tunnelServiceDefinitionMatches(config);
-      if (needsOwnershipMigration || needsProfile) {
-        await assertServiceIdle(config);
-        if (tunnelService.loaded) await stopTunnelService();
-        await bootstrapTunnelProfile(config);
-        installTunnelService(config);
-      } else if (refreshTunnelWorker) {
-        await assertServiceIdle(config);
-        await restartTunnelService();
-      }
-      const status = await waitForTunnelReady(config);
-      if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);
-      tunnelReady = true;
-    }
-  }
-  if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
-    await uninstallService(existing!);
-  }
-  if (launcherOwned) saveConfig(config);
   // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
   // setup removes it once the launcher-owned configuration is already the established baseline.
+  // Cleanup deliberately follows the Codex/config commit so a rollback never needs deleted legacy
+  // binaries to restart the prior daemon.
   const migratingTerminalRuntime = Boolean(
     launcherOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
-  installCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
 
   return {
     mode: config.mode,

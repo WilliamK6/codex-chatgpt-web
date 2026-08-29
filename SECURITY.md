@@ -1,10 +1,17 @@
 # Security policy
 
 Do not open public issues containing ChatGPT cookies, browser storage, tunnel IDs, API keys,
-Codex prompts, tool results, or local filesystem paths. Redact diagnostic bundles before sharing.
+Codex prompts, tool results, local filesystem paths, capability-bearing `openai_base_url` values,
+Responses path capabilities, lifecycle-control bearers, or browser-debug capabilities. Redact
+diagnostic bundles before sharing.
 
-The daemon binds only to loopback. If another local user can access your account or application
-home, treat the browser session and tunnel key as compromised and rotate them.
+The daemon binds only to loopback. Functional Responses routes require a persistent random path
+capability, `/healthz` is public on loopback, and `/admin/*` requires a distinct control bearer.
+Electron automation uses an authenticated private debug broker rather than a raw Chromium DevTools
+port. These controls reject unauthenticated local clients, but arbitrary code running as the same OS
+user may be able to read the owner-only config or browser profile. If another local user or process
+can access your application or Codex home, treat the browser session, route capability, and tunnel
+key as compromised; sign out and rotate/reinstall the affected credentials.
 
 Read the complete [security model](docs/security-model.md) before enabling full mode. In particular,
 full mode lets an untrusted model response request tools from the current Codex turn; keep connector

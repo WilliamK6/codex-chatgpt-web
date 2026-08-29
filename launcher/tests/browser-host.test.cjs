@@ -921,6 +921,7 @@ test("connector verification is effort-independent and works while the browser s
       calls.push(["helper", options]);
       return { ok: true, appName: options.appName };
     },
+    browserHelperAuthorization: () => ({}),
   };
 
   const result = await BrowserHost.prototype.runConnectorVerification.call(fixture, "Codex Native2");
@@ -938,6 +939,72 @@ test("connector verification is effort-independent and works while the browser s
         logger: fixture.logger,
       }],
     ],
+  );
+});
+
+test("private debug surfaces require the exact active helper owner", () => {
+  const homeContents = { name: "home" };
+  const turnContents = { name: "turn" };
+  const homeSurfaceId = "h".repeat(32);
+  const turnSurfaceId = "t".repeat(32);
+  const homeLease = "home-lease-token-0123456789abcdefghijklmnopqr";
+  const turnLease = "turn-lease-token-0123456789abcdefghijklmnopqr";
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    surfaceId: homeSurfaceId,
+    view: { webContents: homeContents },
+    manualOperation: "browser smoke test",
+    manualHelperLeases: new Map([[process.pid, homeLease]]),
+    turnTabs: new Map([["turn", {
+      surfaceId: turnSurfaceId,
+      helperPid: process.pid,
+      debugLeaseToken: turnLease,
+      status: "running",
+      view: { webContents: turnContents },
+    }]]),
+  });
+
+  assert.equal(fixture.resolveDebugSurface(homeSurfaceId, process.pid, homeLease), homeContents);
+  assert.equal(fixture.resolveDebugSurface(turnSurfaceId, process.pid, turnLease), turnContents);
+  assert.throws(() => fixture.resolveDebugSurface(homeSurfaceId, process.pid, turnLease), /not owned/);
+  assert.throws(() => fixture.resolveDebugSurface(turnSurfaceId, process.pid, homeLease), /not owned/);
+  assert.throws(() => fixture.resolveDebugSurface(homeSurfaceId, process.pid + 1, homeLease), /not owned/);
+  assert.throws(() => fixture.resolveDebugSurface(turnSurfaceId, process.pid + 1, turnLease), /not owned/);
+
+  fixture.manualOperation = null;
+  assert.throws(() => fixture.resolveDebugSurface(homeSurfaceId, process.pid, homeLease), /not owned/);
+  fixture.turnTabs.get("turn").status = "complete";
+  assert.throws(() => fixture.resolveDebugSurface(turnSurfaceId, process.pid, turnLease), /not owned/);
+  fixture.turnTabs.set("duplicate", {
+    ...fixture.turnTabs.get("turn"),
+    status: "running",
+  });
+  assert.throws(() => fixture.resolveDebugSurface(turnSurfaceId, process.pid, turnLease), /not available/);
+});
+
+test("manual browser helper authorization binds and revokes an unshared operation lease", () => {
+  const contents = { isDestroyed: () => false };
+  const revoked = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    surfaceId: "h".repeat(32),
+    view: { webContents: contents },
+    manualOperation: "session inspection",
+    manualHelperLeases: new Map(),
+    revokeDebugSurface: candidate => revoked.push(candidate),
+  });
+
+  const authorization = fixture.browserHelperAuthorization();
+  assert.match(authorization.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
+  authorization.onSpawn(process.pid);
+  assert.equal(
+    fixture.resolveDebugSurface(fixture.surfaceId, process.pid, authorization.debugLeaseToken),
+    contents,
+  );
+  authorization.onExit(process.pid);
+  assert.equal(fixture.manualHelperLeases.size, 0);
+  assert.deepEqual(revoked, [contents]);
+  assert.throws(
+    () => fixture.resolveDebugSurface(fixture.surfaceId, process.pid, authorization.debugLeaseToken),
+    /not owned/,
   );
 });
 
@@ -965,6 +1032,7 @@ test("a replacement helper takes over only after the previous owner exited", () 
     surfaceId: "surface-dead-owner",
     traceId: "trace_dead_owner",
     helperPid: deadPid,
+    debugLeaseToken: "old-turn-lease-token-0123456789abcdefghijklmnop",
     status: "running",
     loading: true,
     message: "ChatGPT is working",
@@ -976,6 +1044,7 @@ test("a replacement helper takes over only after the previous owner exited", () 
     },
   };
   const warnings = [];
+  const revoked = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     manualOperation: null,
     turnTabs: new Map([[tab.id, tab]]),
@@ -985,6 +1054,7 @@ test("a replacement helper takes over only after the previous owner exited", () 
     snapshot: () => ({ tabs: [] }),
     publishState() {},
     writeDescriptor() {},
+    revokeDebugSurface: contents => revoked.push(contents),
     logger: { info() {}, warn: (event, detail) => warnings.push([event, detail]) },
   });
 
@@ -992,10 +1062,14 @@ test("a replacement helper takes over only after the previous owner exited", () 
 
   assert.deepEqual(lease, {
     surfaceId: tab.surfaceId,
+    debugLeaseToken: lease.debugLeaseToken,
     tabId: tab.id,
     reused: false,
     connectorBound: false,
   });
+  assert.match(lease.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
+  assert.notEqual(lease.debugLeaseToken, "old-turn-lease-token-0123456789abcdefghijklmnop");
+  assert.deepEqual(revoked, [tab.view.webContents]);
   assert.equal(tab.helperPid, process.pid);
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0][0], "browser.stale_turn_owner_replaced");
@@ -1078,6 +1152,7 @@ test("removing the final turn tab hides an uninitialized idle host instead of ex
     id: "tab-gray-host",
     traceId: "trace_gray_host",
     helperPid: 666,
+    debugLeaseToken: "remove-turn-lease-token-0123456789abcdefghijklmn",
     status: "aborted",
     view: {
       webContents: {
@@ -1097,11 +1172,12 @@ test("removing the final turn tab hides an uninitialized idle host instead of ex
     snapshot: () => ({ tabs: [] }),
     publishState() {},
     writeDescriptor() {},
+    revokeDebugSurface: () => calls.push("debug-revoke"),
   });
 
   BrowserHost.prototype.removeTurnTab.call(fixture, tab, false);
 
-  assert.deepEqual(calls, ["view-remove", "contents-close", "hide"]);
+  assert.deepEqual(calls, ["debug-revoke", "view-remove", "contents-close", "hide"]);
 });
 
 test("hard refresh accepts Chromium's completed loading cycle even without did-finish-load", async () => {
@@ -1443,6 +1519,7 @@ test("a later provider round reuses only its exact connector-bound conversation"
     connectorIdentity: "Codex Native2",
     connectorBound: true,
     helperPid: 111,
+    debugLeaseToken: "retained-old-lease-token-0123456789abcdefghijklm",
     status: "ready",
     loading: false,
     message: "Task completed",
@@ -1455,6 +1532,7 @@ test("a later provider round reuses only its exact connector-bound conversation"
     },
   };
   const events = [];
+  const revoked = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     manualOperation: null,
     turnTabs: new Map([[tab.id, tab]]),
@@ -1464,6 +1542,7 @@ test("a later provider round reuses only its exact connector-bound conversation"
     snapshot: () => ({ tabs: [] }),
     publishState: () => events.push("published"),
     writeDescriptor: () => events.push("descriptor"),
+    revokeDebugSurface: contents => revoked.push(contents),
     logger: { info: (event) => events.push(event) },
   });
 
@@ -1478,10 +1557,14 @@ test("a later provider round reuses only its exact connector-bound conversation"
 
   assert.deepEqual(lease, {
     surfaceId: "surface-reused",
+    debugLeaseToken: lease.debugLeaseToken,
     tabId: "tab-reused",
     reused: true,
     connectorBound: true,
   });
+  assert.match(lease.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
+  assert.notEqual(lease.debugLeaseToken, "retained-old-lease-token-0123456789abcdefghijklm");
+  assert.deepEqual(revoked, [tab.view.webContents]);
   assert.equal(tab.traceId, "trace_next");
   assert.equal(tab.helperPid, 222);
   assert.equal(tab.status, "running");
@@ -1529,10 +1612,12 @@ test("a retained conversation is not reused for a different connector identity",
 
   assert.deepEqual(lease, {
     surfaceId: "surface-fresh",
+    debugLeaseToken: lease.debugLeaseToken,
     tabId: "fresh",
     reused: false,
     connectorBound: false,
   });
+  assert.match(lease.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
   assert.equal(retained.status, "ready");
 });
 
@@ -1557,22 +1642,22 @@ test("a connector conversation is not reused until its connector was bound", () 
     logger: { info() {} },
   });
 
-  assert.deepEqual(
-    BrowserHost.prototype.beginTurn.call(
+  const lease = BrowserHost.prototype.beginTurn.call(
       fixture,
       "trace_next",
       false,
       222,
       conversationKey,
       "Codex Native2",
-    ),
-    {
-      surfaceId: "surface-fresh",
-      tabId: "fresh",
-      reused: false,
-      connectorBound: false,
-    },
-  );
+    );
+  assert.deepEqual(lease, {
+    surfaceId: "surface-fresh",
+    debugLeaseToken: lease.debugLeaseToken,
+    tabId: "fresh",
+    reused: false,
+    connectorBound: false,
+  });
+  assert.match(lease.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
 });
 
 test("a required retained conversation fails before creating a browser tab", () => {
@@ -1648,6 +1733,7 @@ test("ending one browser turn does not stop another running tab", async () => {
     id: "tab-ended",
     traceId: "trace_ended",
     helperPid: 555,
+    debugLeaseToken: "ended-turn-lease-token-0123456789abcdefghijklmn",
     status: "running",
     loading: true,
     view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {}, close: () => { closedViews += 1; } } },
@@ -1656,6 +1742,7 @@ test("ending one browser turn does not stop another running tab", async () => {
     id: "tab-active",
     traceId: "trace_active",
     helperPid: 666,
+    debugLeaseToken: "active-turn-lease-token-0123456789abcdefghijklmn",
     status: "running",
     loading: true,
     view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
@@ -1675,6 +1762,10 @@ test("ending one browser turn does not stop another running tab", async () => {
     snapshot: () => ({ tabs: [] }),
     hide: () => assert.fail("a second running tab must keep the browser host active"),
     logger: { info() {} },
+    revokeDebugSurface: contents => {
+      assert.equal(contents, ended.view.webContents);
+      ended.debugRevocations = (ended.debugRevocations || 0) + 1;
+    },
   });
 
   await BrowserHost.prototype.endTurn.call(
@@ -1691,6 +1782,9 @@ test("ending one browser turn does not stop another running tab", async () => {
   assert.equal(fixture.selectedTabId, active.id);
   assert.equal(closedViews, 1);
   assert.equal(removedViews, 1);
+  assert.equal(ended.debugRevocations, 1);
+  assert.equal(ended.debugLeaseToken, null);
+  assert.notEqual(active.debugLeaseToken, null);
   assert.equal(active.status, "running");
   assert.equal(fixture.activeTraceId, active.traceId);
 });
@@ -1705,6 +1799,7 @@ test("a completed keyed turn is retained for thirty minutes and preserves its ac
     connectorIdentity: "Codex Native2",
     connectorBound: false,
     helperPid: 777,
+    debugLeaseToken: "retained-turn-lease-token-0123456789abcdefghijk",
     status: "running",
     loading: true,
     view: { webContents: {
@@ -1723,6 +1818,10 @@ test("a completed keyed turn is retained for thirty minutes and preserves its ac
     snapshot: () => ({ tabs: [] }),
     hide() {},
     logger: { info() {} },
+    revokeDebugSurface: contents => {
+      assert.equal(contents, tab.view.webContents);
+      tab.debugRevocations = (tab.debugRevocations || 0) + 1;
+    },
   });
 
   const result = await BrowserHost.prototype.endTurn.call(
@@ -1742,6 +1841,8 @@ test("a completed keyed turn is retained for thirty minutes and preserves its ac
   assert.equal(tab.connectorBound, true);
   assert.equal(Number.isFinite(tab.lastHeartbeatAt), true);
   assert.deepEqual(throttling, [true]);
+  assert.equal(tab.debugRevocations, 1);
+  assert.equal(tab.debugLeaseToken, null);
 
   const retainedAt = tab.lastHeartbeatAt;
   BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, retainedAt + (30 * 60 * 1000) - 1);

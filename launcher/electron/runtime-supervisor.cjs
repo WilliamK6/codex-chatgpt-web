@@ -177,8 +177,16 @@ function managedTunnelConnectArgs(config, invocation) {
   ];
 }
 
-function validateConfig(config, descriptorPath, platform = process.platform, launcherProfile = "production") {
-  if (!config || config.version !== 3) throw new Error("Runtime configuration is missing or unsupported");
+function validateConfig(
+  config,
+  descriptorPath,
+  platform = process.platform,
+  launcherProfile = "production",
+  allowLegacyV3 = false,
+) {
+  if (!config || (config.version !== 4 && !(allowLegacyV3 && config.version === 3))) {
+    throw new Error("Runtime configuration is missing or unsupported");
+  }
   if (launcherProfile === "development") {
     if (config.purpose !== "dev-harness") {
       throw new Error("DEV launcher refuses a configuration that is not marked dev-harness");
@@ -211,6 +219,14 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
   }
   if (typeof config.controlToken !== "string" || !/^[A-Za-z0-9_-]{40,}$/.test(config.controlToken)) {
     throw new Error("Runtime configuration has an invalid lifecycle control token");
+  }
+  if (config.version === 4) {
+    if (typeof config.responsesToken !== "string" || !/^[A-Za-z0-9_-]{40,}$/.test(config.responsesToken)) {
+      throw new Error("Runtime configuration has an invalid Responses capability token");
+    }
+    if (config.responsesToken === config.controlToken) {
+      throw new Error("Runtime configuration reuses its lifecycle token for Responses routing");
+    }
   }
   if (!Number.isSafeInteger(config.contextWindow) || config.contextWindow <= 0) {
     throw new Error("Runtime configuration has an invalid context window");
@@ -321,13 +337,14 @@ class RuntimeSupervisor {
     this.lastChildOutput = { daemon: null, tunnel: null };
   }
 
-  readConfig() {
+  readConfig({ allowLegacyV3 = this.launcherProfile === "development" } = {}) {
     if (!fs.existsSync(this.configPath)) return null;
     return validateConfig(
       readJson(this.configPath),
       this.browserDescriptorPath,
       this.platform,
       this.launcherProfile,
+      allowLegacyV3,
     );
   }
 
@@ -1732,7 +1749,7 @@ class RuntimeSupervisor {
   }
 
   async cancelActiveTurns() {
-    const config = this.readConfig();
+    const config = this.readConfig({ allowLegacyV3: true });
     const daemon = this.daemon;
     if (!config || !daemon || daemon.exitCode !== null || daemon.signalCode !== null) {
       return { cancelledHttpTurns: 0, cancelledBrowserTurns: 0 };
@@ -1834,7 +1851,7 @@ class RuntimeSupervisor {
         this.logger.warn("runtime.start_failed_before_stop", { message: errorMessage(error) });
       }
     }
-    const config = this.readConfig();
+    const config = this.readConfig({ allowLegacyV3: true });
     this.stopping = true;
     this.stopTunnelMonitor();
     for (const name of ["daemon", "tunnel"]) {
