@@ -1,4 +1,4 @@
-import { readJsonRequestBody } from "./http-body";
+import { readEncodedRequestBody, readJsonRequestBody } from "./http-body";
 import {
   BRIDGE_COMPACTION_PREFIX,
   SUMMARY_PREFIX,
@@ -27,7 +27,13 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 export type NativeFetch = (request: Request) => Promise<Response>;
-export type NativeCodexEndpoint = "models" | "responses" | "responses/compact" | "alpha/search";
+export type NativeCodexEndpoint =
+  | "models"
+  | "responses"
+  | "responses/compact"
+  | "alpha/search"
+  | "images/edits"
+  | "images/generations";
 
 type JsonObject = Record<string, unknown>;
 type BridgeCompactionItem = JsonObject & { type: "compaction"; encrypted_content: string };
@@ -52,6 +58,10 @@ export function codexClientVersionFromUserAgent(userAgent: string | null): strin
   const version = /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})(?:[-+][0-9A-Za-z.-]+)?(?:\s|$)/
     .exec(userAgent.slice(separator + 1));
   return version ? `${version[1]}.${version[2]}.${version[3]}` : undefined;
+}
+
+function isNativeImageEndpoint(endpoint: NativeCodexEndpoint): boolean {
+  return endpoint === "images/edits" || endpoint === "images/generations";
 }
 
 function isObject(value: unknown): value is JsonObject {
@@ -220,16 +230,25 @@ export async function forwardNativeCodexRequest(
   const method = endpoint === "models" ? "GET" : "POST";
   let body: BodyInit | undefined;
   if (method === "POST") {
-    const parseRequest = decodedBody === undefined ? request.clone() : undefined;
-    const originalBody = await request.arrayBuffer();
-    const scrubbed = scrubBridgeArtifactsForNative(
-      decodedBody === undefined ? await readJsonRequestBody(parseRequest!) : decodedBody,
-    );
-    if (scrubbed.changed) {
-      headers.delete("content-encoding");
-      body = JSON.stringify(scrubbed.value);
-    } else {
+    const parseRequest = !isNativeImageEndpoint(endpoint) && decodedBody === undefined
+      ? request.clone()
+      : undefined;
+    const originalBody = await readEncodedRequestBody(request);
+    if (isNativeImageEndpoint(endpoint)) {
+      // Image edits are multipart/form-data and generations are ordinary JSON. Both are native
+      // Codex capabilities, so preserve their bytes and content headers exactly instead of trying
+      // to parse them as Responses payloads.
       body = originalBody;
+    } else {
+      const scrubbed = scrubBridgeArtifactsForNative(
+        decodedBody === undefined ? await readJsonRequestBody(parseRequest!) : decodedBody,
+      );
+      if (scrubbed.changed) {
+        headers.delete("content-encoding");
+        body = JSON.stringify(scrubbed.value);
+      } else {
+        body = originalBody;
+      }
     }
   }
   const upstreamRequest = new Request(`${CODEX_BACKEND}/${endpoint}${incomingUrl.search}`, {

@@ -35,6 +35,8 @@ const GATEWAY_AGENT_WAIT_TOOL_NAMES = new Set([
 const turnTokenSchema = z.string().min(20).max(256);
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 10_000;
+const CHATGPT_WEB_MCP_IMAGE_RESULT_NOTICE =
+  "The native image operation completed in the outer Codex task. ChatGPT custom connectors reject inline MCP image-result blocks, so the image bytes were not repeated here. The full-resolution result remains displayed or saved in outer Codex; use the local path from the text result or from your tool request. Do not claim that you saw, inspected, or verified the omitted image pixels, and do not retry the same image-returning tool to recover them. Continue from the text result or ask the user to inspect the outer Codex result.";
 // The OpenAI tunnel currently owns a two-minute command-response deadline. The local MCP server
 // must settle first so an abandoned native tool call is returned as an MCP error instead of
 // letting the tunnel tear down and poison its long-lived stdio transport.
@@ -211,9 +213,33 @@ export function chatGptMcpInvocationTimeout(
   return Math.min(CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, remaining);
 }
 
-function asMcpResult(value: BrokerToolResult) {
+function isMcpImageContent(value: unknown): value is Record<string, unknown> & {
+  type: "image";
+  data: string;
+  mimeType: string;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const block = value as Record<string, unknown>;
+  return block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string";
+}
+
+export function chatGptBrowserSafeMcpResult(
+  value: BrokerToolResult,
+) {
+  let omittedImages = 0;
+  const content = value.content.flatMap(block => {
+    if (!isMcpImageContent(block)) return [block];
+    omittedImages += 1;
+    return [];
+  });
+  if (omittedImages > 0) {
+    content.push({
+      type: "text",
+      text: `${CHATGPT_WEB_MCP_IMAGE_RESULT_NOTICE} Omitted inline image blocks: ${omittedImages}.`,
+    });
+  }
   return {
-    content: value.content as never,
+    content: content as never,
     ...(value.structuredContent !== undefined && value.structuredContent !== null && typeof value.structuredContent === "object"
       ? { structuredContent: value.structuredContent as Record<string, unknown> }
       : {}),
@@ -555,7 +581,7 @@ export async function runChatGptMcpServer(options: {
         freeform: tool.freeform === true,
         ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
       }, timeoutMs, signal);
-      return asMcpResult(response);
+      return chatGptBrowserSafeMcpResult(response);
     } catch (error) {
       // A cancelled/timed-out MCP request no longer has a consumer for the native result. Revoke
       // the whole turn capability so the broker drops the pending invocation and every later call

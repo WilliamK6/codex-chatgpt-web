@@ -42,7 +42,7 @@ import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
 
-type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified";
+type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "images" | "unspecified";
 
 function capabilityMatches(expected: string, supplied: string): boolean {
   const wanted = Buffer.from(expected);
@@ -349,6 +349,18 @@ export async function nativeSearchRequest(
 ): Promise<Response> {
   try {
     return await forwardNativeCodexRequest(req, "alpha/search", fetchUpstream);
+  } catch (error) {
+    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+  }
+}
+
+export async function nativeImageRequest(
+  req: Request,
+  endpoint: "images/edits" | "images/generations",
+  fetchUpstream?: NativeFetch,
+): Promise<Response> {
+  try {
+    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -851,6 +863,18 @@ export function startServer(
           req.signal,
           process.platform,
           "search",
+        );
+      }
+      if (req.method === "POST" && (
+        routePath === "/v1/images/edits" || routePath === "/v1/images/generations"
+      )) {
+        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        const endpoint = routePath === "/v1/images/edits" ? "images/edits" : "images/generations";
+        return httpTurns.track(
+          signal => nativeImageRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream),
+          req.signal,
+          process.platform,
+          "images",
         );
       }
       return new Response("Not found", { status: 404 });

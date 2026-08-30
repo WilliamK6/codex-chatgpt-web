@@ -22,7 +22,11 @@ import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive } from "../src/adapters/chatgpt-web/turn-progress";
-import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
+import {
+  CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS,
+  chatGptBrowserSafeMcpResult,
+  chatGptMcpInvocationTimeout,
+} from "../src/adapters/chatgpt-web/mcp-server";
 import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
@@ -247,6 +251,48 @@ function toolResult(value: Record<string, unknown>): BrokerToolResult {
     structuredContent: value,
   };
 }
+
+test("removes MCP image blocks rejected by ChatGPT while preserving the full-resolution outer result", () => {
+  const result = chatGptBrowserSafeMcpResult({
+    content: [
+      { type: "image", data: "small-inline-image", mimeType: "image/png" },
+      { type: "image", data: "a".repeat(1_000_000), mimeType: "image/jpeg" },
+      { type: "text", text: "Generated image remains saved at /private/tmp/full.png" },
+    ],
+  });
+
+  expect(result.content as unknown[]).toEqual([
+    { type: "text", text: "Generated image remains saved at /private/tmp/full.png" },
+    expect.objectContaining({
+      type: "text",
+      text: expect.stringContaining("Omitted inline image blocks: 2"),
+    }),
+  ]);
+  const notice = (result.content as Array<{ type: string; text?: string }>).at(-1)?.text ?? "";
+  expect(notice).toContain("Do not claim that you saw, inspected, or verified the omitted image pixels");
+  expect(notice).toContain("do not retry the same image-returning tool");
+});
+
+test("preserves text and result metadata when omitting an MCP image block", () => {
+  const value: BrokerToolResult = {
+    content: [
+      { type: "image", data: "inline-image", mimeType: "image/tiff" },
+      { type: "text", text: "Inspect /private/tmp/full.tiff locally" },
+    ],
+    structuredContent: { saved: true },
+    isError: true,
+    _meta: { trace: "safe" },
+  };
+  const result = chatGptBrowserSafeMcpResult(value);
+
+  expect(result.content as unknown[]).toEqual([
+    { type: "text", text: "Inspect /private/tmp/full.tiff locally" },
+    expect.objectContaining({ type: "text", text: expect.stringContaining("outer Codex task") }),
+  ]);
+  expect(result.structuredContent).toEqual({ saved: true });
+  expect(result.isError).toBeTrue();
+  expect(result._meta).toEqual({ trace: "safe" });
+});
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

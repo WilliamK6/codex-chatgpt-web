@@ -91,6 +91,85 @@ test("forwards standalone Web Search through the authenticated native Codex rout
   expect(await response.json()).toEqual({ results: [{ title: "result" }] });
 });
 
+test("forwards native multipart image edits byte-for-byte", async () => {
+  const boundary = "----codex-image-boundary";
+  const body = Buffer.from([
+    `--${boundary}`,
+    'Content-Disposition: form-data; name="model"',
+    "",
+    "gpt-image-2",
+    `--${boundary}`,
+    'Content-Disposition: form-data; name="image"; filename="source.jpg"',
+    "Content-Type: image/jpeg",
+    "",
+    "synthetic-jpeg-bytes",
+    `--${boundary}--`,
+    "",
+  ].join("\r\n"));
+  const request = new Request("http://127.0.0.1:17841/v1/images/edits", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+      host: "127.0.0.1:17841",
+    },
+    body,
+  });
+  let upstreamRequest: Request | undefined;
+  const response = await forwardNativeCodexRequest(request, "images/edits", async input => {
+    upstreamRequest = input;
+    return Response.json({ data: [{ b64_json: "result" }] });
+  });
+
+  expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+  expect(upstreamRequest!.method).toBe("POST");
+  expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer codex-oauth-token");
+  expect(upstreamRequest!.headers.get("content-type")).toBe(`multipart/form-data; boundary=${boundary}`);
+  expect(upstreamRequest!.headers.get("host")).toBeNull();
+  expect(Buffer.from(await upstreamRequest!.arrayBuffer())).toEqual(body);
+  expect(await response.json()).toEqual({ data: [{ b64_json: "result" }] });
+});
+
+test("forwards native image generations without applying Responses rewriting", async () => {
+  const body = JSON.stringify({ model: "gpt-image-2", prompt: "a test image" });
+  const request = new Request("http://127.0.0.1:17841/v1/images/generations", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "content-type": "application/json",
+    },
+    body,
+  });
+  let upstreamRequest: Request | undefined;
+  await forwardNativeCodexRequest(request, "images/generations", async input => {
+    upstreamRequest = input;
+    return Response.json({ data: [] });
+  });
+
+  expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+  expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer codex-oauth-token");
+  expect(await upstreamRequest!.text()).toBe(body);
+});
+
+test("rejects oversized native image payloads before contacting the upstream", async () => {
+  const request = new Request("http://127.0.0.1:17841/v1/images/edits", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "content-type": "multipart/form-data; boundary=test",
+      "content-length": String(64 * 1024 * 1024 + 1),
+    },
+    body: "small-test-body",
+  });
+  let upstreamCalled = false;
+
+  await expect(forwardNativeCodexRequest(request, "images/edits", async () => {
+    upstreamCalled = true;
+    return Response.json({ data: [] });
+  })).rejects.toThrow("Encoded request body exceeds 67108864 bytes");
+  expect(upstreamCalled).toBe(false);
+});
+
 test("removes ChatGPT Web item identities before native Codex compaction", async () => {
   const body = {
     model: "gpt-5.6-sol",

@@ -707,6 +707,8 @@ test("functional Responses routes require the distinct path capability before an
     { method: "POST", path: "/responses" },
     { method: "POST", path: "/responses/compact" },
     { method: "POST", path: "/alpha/search" },
+    { method: "POST", path: "/images/edits" },
+    { method: "POST", path: "/images/generations" },
   ];
   try {
     for (const route of routes) {
@@ -824,6 +826,41 @@ test("server exposes authenticated standalone Web Search on the routed v1 base U
     expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/alpha/search");
     expect(upstreamRequest!.headers.get("authorization")).toBe(nativeAuthorization);
     expect(await upstreamRequest!.json()).toEqual({ query: "bridge route" });
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("server exposes native image edits only through the authenticated routed base URL", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  let upstreamRequest: Request | undefined;
+  const server = startServer(config, {
+    fetchUpstream: async request => {
+      upstreamRequest = request;
+      return Response.json({ data: [{ b64_json: "edited" }] });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const boundary = "----server-image-boundary";
+  const body = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\ngpt-image-2\r\n--${boundary}--\r\n`);
+  const init = {
+    method: "POST",
+    headers: {
+      authorization: "Bearer opaque-native-session",
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  };
+  try {
+    expect((await fetch(`${endpoint}/v1/images/edits`, init)).status).toBe(404);
+    expect(upstreamRequest).toBeUndefined();
+
+    const response = await fetch(routedEndpoint(endpoint, config.responsesToken, "/images/edits"), init);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: [{ b64_json: "edited" }] });
+    expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+    expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer opaque-native-session");
+    expect(Buffer.from(await upstreamRequest!.arrayBuffer())).toEqual(body);
   } finally {
     await server.stop(true);
   }
