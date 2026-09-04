@@ -2,12 +2,69 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection } from "node:net";
 import { chatGptWebTraceId } from "../src/adapters/chatgpt-web";
+import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
-import { HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import {
+  authenticatedResponsesPath,
+  HttpTurnCounter,
+  responseRequest,
+  routeChatGptWebRequest,
+  startServer,
+} from "../src/server";
+
+function routedEndpoint(endpoint: string, responsesToken: string, path: string): string {
+  return `${endpoint}/${responsesToken}/v1${path}`;
+}
+
+async function incompleteBodyStatus(port: number, path: string): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("server waited for an unauthorized request body"));
+    }, 1_000);
+    let received = "";
+    const finish = (error?: Error, status?: number) => {
+      clearTimeout(timeout);
+      socket.destroy();
+      if (error) reject(error);
+      else resolve(status!);
+    };
+    socket.once("error", error => finish(error));
+    socket.on("data", chunk => {
+      received += chunk.toString("latin1");
+      const match = /^HTTP\/1\.[01] (\d{3}) /.exec(received);
+      if (match) finish(undefined, Number(match[1]));
+    });
+    socket.once("connect", () => {
+      socket.write([
+        `POST ${path} HTTP/1.1`,
+        `Host: 127.0.0.1:${port}`,
+        "Content-Type: application/json",
+        "Content-Length: 1000000",
+        "Connection: close",
+        "",
+        "{",
+      ].join("\r\n"));
+    });
+  });
+}
+
+test("Responses capability paths match only the exact single prefix", () => {
+  const token = "responses-path-token-0123456789abcdefghijklmnop";
+  expect(authenticatedResponsesPath(`/${token}/v1/responses`, token)).toBe("/v1/responses");
+  expect(authenticatedResponsesPath("/v1/responses", token)).toBeNull();
+  expect(authenticatedResponsesPath("/wrong-token/v1/responses", token)).toBeNull();
+  expect(authenticatedResponsesPath(`/${encodeURIComponent(`${token}/nested`)}/v1/responses`, token)).toBeNull();
+  expect(authenticatedResponsesPath(`/${token}/${token}/v1/responses`, token)).toBeUndefined();
+  expect(authenticatedResponsesPath(`//${token}/v1/responses`, token)).toBeUndefined();
+  expect(authenticatedResponsesPath(`/${token}/v1x/responses`, token)).toBeUndefined();
+});
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -329,6 +386,80 @@ test("authenticated targeted cancellation terminates one browser trace without r
   }
 });
 
+test("authenticated targeted cancellation aborts a shared structured compaction owner", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const server = startServer(config);
+  const handoffTraceId = "a1b2c3d4e5f6";
+  const traceId = `${handoffTraceId}_fallback`;
+  let aborted = false;
+  const run = runStructuredCompactionOnce(
+    `structured-${Date.now()}-${Math.random()}`,
+    { ownerKey: `owner-${traceId}`, traceIds: [handoffTraceId, traceId] },
+    signal => new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  );
+
+  try {
+    await Bun.sleep(0);
+    const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${config.controlToken}`,
+      },
+      body: JSON.stringify({ traceId }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "ok",
+      trace_id: traceId,
+      cancelled_compaction_runs: 1,
+    });
+    await expect(run).rejects.toThrow("The ChatGPT browser tab was closed");
+    expect(aborted).toBeTrue();
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("authenticated cancel-all aborts fresh structured compaction work", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const server = startServer(config);
+  const key = `structured-all-${Date.now()}-${Math.random()}`;
+  let aborted = false;
+  const run = runStructuredCompactionOnce(
+    key,
+    { ownerKey: `owner-${key}`, traceIds: [`trace-${key}`] },
+    signal => new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  );
+
+  try {
+    await Bun.sleep(0);
+    const response = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turns`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "ok",
+      cancelled_compaction_runs: 1,
+    });
+    await expect(run).rejects.toThrow("Active turn cancelled by launcher");
+    expect(aborted).toBeTrue();
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("a Codex retry after tab cancellation receives terminal HTTP 400 without a new browser", async () => {
   const config = defaultConfig("browser-only");
   const turnId = "turn_cancelled_replay";
@@ -452,7 +583,7 @@ test("authenticated lifecycle control aborts active HTTP work before acknowledgi
     }),
   });
   const endpoint = `http://127.0.0.1:${server.port}`;
-  const activeRequest = fetch(`${endpoint}/v1/alpha/search`, {
+  const activeRequest = fetch(routedEndpoint(endpoint, config.responsesToken, "/alpha/search"), {
     method: "POST",
     headers: {
       authorization: "Bearer test-codex-session",
@@ -559,6 +690,51 @@ test("lifecycle drain and cancellation include browser turns owned by the extern
   }
 });
 
+test("functional Responses routes require the distinct path capability before any work or state oracle", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    fetchUpstream: async () => {
+      upstreamCalls += 1;
+      return Response.json({ results: [] });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const wrongToken = "wrong-responses-token-0123456789abcdefghijklmnop";
+  const routes = [
+    { method: "GET", path: "/models" },
+    { method: "GET", path: "/responses" },
+    { method: "POST", path: "/responses" },
+    { method: "POST", path: "/responses/compact" },
+    { method: "POST", path: "/alpha/search" },
+    { method: "POST", path: "/images/edits" },
+    { method: "POST", path: "/images/generations" },
+  ];
+  try {
+    for (const route of routes) {
+      const init = route.method === "POST"
+        ? { method: route.method, headers: { "content-type": "application/json" }, body: "{}" }
+        : { method: route.method };
+      expect((await fetch(`${endpoint}/v1${route.path}`, init)).status).toBe(404);
+      expect((await fetch(routedEndpoint(endpoint, wrongToken, route.path), init)).status).toBe(404);
+    }
+    expect(await incompleteBodyStatus(server.port!, "/v1/responses")).toBe(404);
+    const drain = await fetch(`${endpoint}/admin/drain`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    expect(drain.status).toBe(200);
+    expect((await fetch(`${endpoint}/v1/models`)).status).toBe(404);
+    expect((await fetch(routedEndpoint(endpoint, config.responsesToken, "/models"))).status).toBe(503);
+    const health = await (await fetch(`${endpoint}/healthz`)).json() as Record<string, unknown>;
+    expect(health.active_http_turns).toBe(0);
+    expect(health.successful_model_catalog_requests).toBe(0);
+    expect(upstreamCalls).toBe(0);
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("a drained runtime rejects new model-catalog work before shutdown", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const server = startServer(config);
@@ -571,7 +747,7 @@ test("a drained runtime rejects new model-catalog work before shutdown", async (
     });
     expect(drain.status).toBe(200);
 
-    const models = await fetch(`${endpoint}/v1/models`);
+    const models = await fetch(routedEndpoint(endpoint, config.responsesToken, "/models"));
     expect(models.status).toBe(503);
     expect(await models.json()).toMatchObject({
       error: {
@@ -611,7 +787,7 @@ test("health proves that Codex received a successful augmented model catalog", a
       last_successful_model_catalog_request_at: null,
     });
 
-    const models = await fetch(`${endpoint}/v1/models`, {
+    const models = await fetch(routedEndpoint(endpoint, config.responsesToken, "/models"), {
       headers: { authorization: "Bearer test-codex-session" },
     });
     expect(models.status).toBe(200);
@@ -634,11 +810,12 @@ test("server exposes authenticated standalone Web Search on the routed v1 base U
     },
   });
   const endpoint = `http://127.0.0.1:${server.port}`;
+  const nativeAuthorization = "Bearer opaque+native/token_value.0123456789==";
   try {
-    const response = await fetch(`${endpoint}/v1/alpha/search`, {
+    const response = await fetch(routedEndpoint(endpoint, config.responsesToken, "/alpha/search"), {
       method: "POST",
       headers: {
-        authorization: "Bearer test-codex-session",
+        authorization: nativeAuthorization,
         "content-type": "application/json",
       },
       body: JSON.stringify({ query: "bridge route" }),
@@ -647,8 +824,43 @@ test("server exposes authenticated standalone Web Search on the routed v1 base U
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ results: ["native-search-result"] });
     expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/alpha/search");
-    expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer test-codex-session");
+    expect(upstreamRequest!.headers.get("authorization")).toBe(nativeAuthorization);
     expect(await upstreamRequest!.json()).toEqual({ query: "bridge route" });
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("server exposes native image edits only through the authenticated routed base URL", async () => {
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  let upstreamRequest: Request | undefined;
+  const server = startServer(config, {
+    fetchUpstream: async request => {
+      upstreamRequest = request;
+      return Response.json({ data: [{ b64_json: "edited" }] });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const boundary = "----server-image-boundary";
+  const body = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\ngpt-image-2\r\n--${boundary}--\r\n`);
+  const init = {
+    method: "POST",
+    headers: {
+      authorization: "Bearer opaque-native-session",
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  };
+  try {
+    expect((await fetch(`${endpoint}/v1/images/edits`, init)).status).toBe(404);
+    expect(upstreamRequest).toBeUndefined();
+
+    const response = await fetch(routedEndpoint(endpoint, config.responsesToken, "/images/edits"), init);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: [{ b64_json: "edited" }] });
+    expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+    expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer opaque-native-session");
+    expect(Buffer.from(await upstreamRequest!.arrayBuffer())).toEqual(body);
   } finally {
     await server.stop(true);
   }

@@ -1,4 +1,5 @@
 import type {
+  CodexAgentMessage,
   CodexAssistantMessage,
   CodexContentPart,
   CodexContext,
@@ -104,6 +105,30 @@ function allowedToolName(tool: unknown): string | undefined {
   return undefined;
 }
 
+function parseTextControls(value: unknown): Pick<CodexRequestOptions, "verbosity" | "outputFormat"> {
+  if (!isObj(value)) return {};
+  const out: Pick<CodexRequestOptions, "verbosity" | "outputFormat"> = {};
+  if (value.verbosity === "low" || value.verbosity === "medium" || value.verbosity === "high") {
+    out.verbosity = value.verbosity;
+  }
+  const format = value.format;
+  if (
+    isObj(format)
+    && format.type === "json_schema"
+    && typeof format.name === "string"
+    && format.name.length > 0
+    && format.schema !== undefined
+  ) {
+    out.outputFormat = {
+      type: "json_schema",
+      name: format.name,
+      strict: format.strict === true,
+      schema: structuredClone(format.schema),
+    };
+  }
+  return out;
+}
+
 const DEFAULT_FUNCTION_NAMESPACE = "functions";
 
 function normalizedToolNamespace(value: unknown): string | undefined {
@@ -184,9 +209,8 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
     }
     else if (typeof t.name === "string" && t.type !== "web_search" && t.type !== "image_generation") {
       // Any other named tool (for example a native computer-use tool type this parser does not
-      // model) is client-executed — pass it through as a function so the routed model can read and
-      // call it naturally; the bridge relays its call as a function_call. Previously such tools were
-      // silently dropped, so the model never saw them.
+      // model) is client-executed. Pass it through as a function so the routed model can call it
+      // naturally and the bridge can relay it as a function_call.
       pushFn(t);
     }
     // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
@@ -341,20 +365,17 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           agentMessage.content as unknown[] | string | undefined,
         );
 
-        const hasContent =
-          typeof content === "string"
-            ? content.trim().length > 0
-            : content.length > 0;
-
-        // An agent_message is external input delivered to the parent agent.
-        // Preserve it as a user-role turn so signed reasoning blocks
-        // on either side are never merged into one modified assistant response.
+        // An agent_message is external input delivered to the parent agent. Keep its distinct
+        // role and routing metadata so Web history remains semantically equivalent to Responses.
         pendingReasoning.length = 0;
-        messages.push({
-          role: "user",
-          content: hasContent ? content : "(sub-agent message received)",
+        const message: CodexAgentMessage = {
+          role: "agentMessage",
+          ...(typeof agentMessage.author === "string" ? { author: agentMessage.author } : {}),
+          ...(typeof agentMessage.recipient === "string" ? { recipient: agentMessage.recipient } : {}),
+          content,
           timestamp: now,
-        });
+        };
+        messages.push(message);
 
         continue;
       }
@@ -595,6 +616,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   if (data.presence_penalty !== undefined) options.presencePenalty = data.presence_penalty;
   if (data.frequency_penalty !== undefined) options.frequencyPenalty = data.frequency_penalty;
   if (data.service_tier !== undefined) options.serviceTier = data.service_tier;
+  Object.assign(options, parseTextControls(data.text));
   if (data.prompt_cache_key !== undefined) options.promptCacheKey = data.prompt_cache_key;
 
   return {

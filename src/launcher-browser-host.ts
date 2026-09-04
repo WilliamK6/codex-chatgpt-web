@@ -1,10 +1,12 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { createConnection, type Socket } from "node:net";
 import { resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { expandUserPath } from "./config";
 import { processRunning } from "./process";
 
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
+export const LAUNCHER_BROWSER_IDLE_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Cmeta%20charset%3D%22utf-8%22%3E%3Ctitle%3ECodex%20Web%20GPT%3C%2Ftitle%3E%3C%2Fhead%3E%3Cbody%3E%3C%2Fbody%3E%3C%2Fhtml%3E#codex-web-gpt-browser-host";
 export type LauncherBrowserHostProfile = "production" | "development";
 
 export class LauncherBrowserTurnCancelledError extends Error {
@@ -21,12 +23,29 @@ export class LauncherRetainedConversationUnavailableError extends Error {
   }
 }
 
+export class LauncherManualTurnTimedOutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LauncherManualTurnTimedOutError";
+  }
+}
+
+export class LauncherManualTurnFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LauncherManualTurnFailedError";
+  }
+}
+
 export interface LauncherBrowserHostDescriptor {
-  version: 2;
+  version: 3;
   kind: typeof LAUNCHER_BROWSER_HOST_KIND;
   profile: LauncherBrowserHostProfile;
   pid: number;
-  endpoint: string;
+  debug: {
+    endpoint: string;
+    token: string;
+  };
   control: {
     endpoint: string;
     token: string;
@@ -62,12 +81,35 @@ function assertLoopbackEndpoint(value: unknown, label: string): string {
   return parsed.origin;
 }
 
+function assertPrivateDebugEndpoint(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error("Launcher private debug endpoint is missing");
+  let parsed: URL;
+  try { parsed = new URL(value); }
+  catch { throw new Error("Launcher private debug endpoint is not a valid URL"); }
+  if (parsed.protocol !== "tcp:" || parsed.hostname !== "127.0.0.1") {
+    throw new Error("Launcher private debug endpoint must use tcp://127.0.0.1");
+  }
+  if (!parsed.port || parsed.username || parsed.password
+    || (parsed.pathname !== "" && parsed.pathname !== "/")
+    || parsed.search || parsed.hash) {
+    throw new Error("Launcher private debug endpoint must contain only a loopback host and explicit port");
+  }
+  return `tcp://127.0.0.1:${parsed.port}`;
+}
+
+function assertDebugLeaseToken(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{40,}$/.test(value)) {
+    throw new Error("Launcher private debug lease token is invalid");
+  }
+  return value;
+}
+
 function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Launcher browser descriptor is not an object");
   }
   const descriptor = value as Partial<LauncherBrowserHostDescriptor>;
-  if (descriptor.version !== 2 || descriptor.kind !== LAUNCHER_BROWSER_HOST_KIND) {
+  if (descriptor.version !== 3 || descriptor.kind !== LAUNCHER_BROWSER_HOST_KIND) {
     throw new Error("Launcher browser descriptor has an unsupported identity or version");
   }
   if (descriptor.profile !== "production" && descriptor.profile !== "development") {
@@ -76,7 +118,13 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (!Number.isInteger(descriptor.pid) || descriptor.pid! < 1) {
     throw new Error("Launcher browser descriptor has an invalid pid");
   }
-  const endpoint = assertLoopbackEndpoint(descriptor.endpoint, "Launcher CDP endpoint");
+  if (!descriptor.debug || typeof descriptor.debug !== "object") {
+    throw new Error("Launcher browser descriptor is missing its private debug channel");
+  }
+  const debugEndpoint = assertPrivateDebugEndpoint(descriptor.debug.endpoint);
+  if (typeof descriptor.debug.token !== "string" || !/^[A-Za-z0-9_-]{40,}$/.test(descriptor.debug.token)) {
+    throw new Error("Launcher browser descriptor has an invalid private debug token");
+  }
   if (!descriptor.control || typeof descriptor.control !== "object") {
     throw new Error("Launcher browser descriptor is missing its control channel");
   }
@@ -101,7 +149,7 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (descriptor.partition !== expectedPartition) {
     throw new Error("Launcher browser descriptor identifies an unexpected browser partition");
   }
-  if (descriptor.idleUrl !== "about:blank#codex-web-gpt-browser-host") {
+  if (descriptor.idleUrl !== LAUNCHER_BROWSER_IDLE_URL) {
     throw new Error("Launcher browser descriptor identifies an unexpected idle surface");
   }
   if (typeof descriptor.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(descriptor.surfaceId)) {
@@ -111,11 +159,11 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
     throw new Error("Launcher browser descriptor has an invalid creation time");
   }
   return {
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: descriptor.profile,
     pid: descriptor.pid!,
-    endpoint,
+    debug: { endpoint: debugEndpoint, token: descriptor.debug.token },
     control: { endpoint: controlEndpoint, token: descriptor.control.token },
     helper: { executable: helperExecutable, script: helperScript },
     partition: descriptor.partition,
@@ -149,21 +197,205 @@ export function readLauncherBrowserHostDescriptor(configuredPath: string): Launc
   return descriptor;
 }
 
-async function assertCdpReady(descriptor: LauncherBrowserHostDescriptor, timeoutMs: number): Promise<void> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${descriptor.endpoint}/json/version`, { signal: controller.signal });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const body = await response.json() as Record<string, unknown>;
-    if (typeof body.webSocketDebuggerUrl !== "string" || !body.webSocketDebuggerUrl.startsWith("ws://127.0.0.1:")) {
-      throw new Error("CDP metadata did not expose a loopback WebSocket endpoint");
-    }
-  } catch (error) {
-    throw new Error(`Launcher browser CDP endpoint is not ready: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    clearTimeout(timer);
+const MAX_DEBUG_FRAME_BYTES = 128 * 1024 * 1024;
+
+export interface LauncherDebugTransport {
+  onmessage?: (message: object) => void;
+  onclose?: (reason?: string) => void;
+  send(message: object): void;
+  close(): void;
+}
+
+class PrivateLauncherDebugTransport implements LauncherDebugTransport {
+  onmessage?: (message: object) => void;
+  onclose?: (reason?: string) => void;
+  private readonly frameHeader = Buffer.alloc(4);
+  private frameHeaderBytes = 0;
+  private frame: Buffer | null = null;
+  private frameBytes = 0;
+  private closed = false;
+  private ready = false;
+  private readonly socket: Socket;
+  private readonly abortSignal?: AbortSignal;
+  private readonly abortHandler: () => void;
+  private readonly readyPromise: Promise<void>;
+  private resolveReady!: () => void;
+  private rejectReady!: (error: Error) => void;
+
+  constructor(
+    descriptor: LauncherBrowserHostDescriptor,
+    surfaceId: string,
+    debugLeaseToken: string,
+    timeoutMs: number,
+    abortSignal?: AbortSignal,
+  ) {
+    const endpoint = new URL(descriptor.debug.endpoint);
+    this.readyPromise = new Promise<void>((resolveReady, rejectReady) => {
+      this.resolveReady = resolveReady;
+      this.rejectReady = rejectReady;
+    });
+    this.socket = createConnection({ host: endpoint.hostname, port: Number(endpoint.port) });
+    this.abortSignal = abortSignal;
+    this.abortHandler = () => this.failBeforeReady(
+      new DOMException("Launcher browser connection aborted", "AbortError"),
+    );
+    this.socket.setNoDelay(true);
+    const timer = setTimeout(
+      () => this.failBeforeReady(new Error(`private debug authentication timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    abortSignal?.addEventListener("abort", this.abortHandler, { once: true });
+    this.readyPromise.finally(() => {
+      clearTimeout(timer);
+    }).catch(() => {});
+    this.socket.once("connect", () => {
+      this.write({
+        type: "authenticate",
+        token: descriptor.debug.token,
+        surfaceId,
+        helperPid: process.pid,
+        leaseToken: debugLeaseToken,
+      });
+    });
+    this.socket.on("data", chunk => this.handleData(Buffer.from(chunk)));
+    this.socket.on("error", error => this.failBeforeReady(
+      new Error(`private debug transport failed: ${error instanceof Error ? error.message : String(error)}`),
+    ));
+    this.socket.on("close", () => {
+      if (!this.ready) this.failBeforeReady(new Error("private debug transport closed before authentication"));
+      this.finish("private debug transport closed");
+    });
+    if (abortSignal?.aborted) this.abortHandler();
   }
+
+  async authenticated(): Promise<this> {
+    await this.readyPromise;
+    return this;
+  }
+
+  private write(value: object): void {
+    if (this.closed || this.socket.destroyed) return;
+    const frame = Buffer.from(JSON.stringify(value));
+    if (frame.length > MAX_DEBUG_FRAME_BYTES) {
+      this.finish("private debug frame is too large");
+      return;
+    }
+    const header = Buffer.allocUnsafe(4);
+    header.writeUInt32BE(frame.length);
+    this.socket.cork();
+    this.socket.write(header);
+    this.socket.write(frame);
+    this.socket.uncork();
+  }
+
+  private handleData(chunk: Buffer): void {
+    if (this.closed) return;
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (!this.frame) {
+        const headerBytes = Math.min(4 - this.frameHeaderBytes, chunk.length - offset);
+        chunk.copy(this.frameHeader, this.frameHeaderBytes, offset, offset + headerBytes);
+        this.frameHeaderBytes += headerBytes;
+        offset += headerBytes;
+        if (this.frameHeaderBytes < 4) return;
+        const length = this.frameHeader.readUInt32BE(0);
+        this.frameHeaderBytes = 0;
+        if (length < 1 || length > MAX_DEBUG_FRAME_BYTES) {
+          this.finish("private debug frame is too large");
+          return;
+        }
+        this.frame = Buffer.allocUnsafe(length);
+        this.frameBytes = 0;
+      }
+      const frameBytes = Math.min(this.frame.length - this.frameBytes, chunk.length - offset);
+      chunk.copy(this.frame, this.frameBytes, offset, offset + frameBytes);
+      this.frameBytes += frameBytes;
+      offset += frameBytes;
+      if (this.frameBytes < this.frame.length) return;
+      const frame = this.frame;
+      this.frame = null;
+      this.frameBytes = 0;
+      let message: { type?: unknown; message?: unknown; error?: unknown; reason?: unknown };
+      try { message = JSON.parse(frame.toString("utf8")); }
+      catch {
+        this.finish("private debug transport returned invalid JSON");
+        return;
+      }
+      if (message.type === "ready" && !this.ready) {
+        this.ready = true;
+        this.resolveReady();
+      } else if (message.type === "cdp" && this.ready && message.message && typeof message.message === "object") {
+        this.onmessage?.(message.message as object);
+      } else if (message.type === "closed") {
+        this.finish(typeof message.reason === "string" ? message.reason : "private debug transport closed");
+        return;
+      } else if (message.type === "error") {
+        const detail = typeof message.error === "string" ? message.error : "rejected";
+        if (!this.ready) this.failBeforeReady(new Error(`private debug authentication failed: ${detail}`));
+        else this.finish(`private debug transport failed: ${detail}`);
+        return;
+      } else {
+        this.finish("private debug transport returned an invalid frame");
+        return;
+      }
+    }
+  }
+
+  private failBeforeReady(error: Error): void {
+    if (!this.ready) this.rejectReady(error);
+    this.finish(error.message);
+  }
+
+  private finish(reason: string): void {
+    if (this.closed) return;
+    if (!this.ready) this.rejectReady(new Error(reason));
+    this.closed = true;
+    this.abortSignal?.removeEventListener("abort", this.abortHandler);
+    if (!this.socket.destroyed) this.socket.destroy();
+    queueMicrotask(() => this.onclose?.(reason));
+  }
+
+  send(message: object): void {
+    if (!this.ready || this.closed) throw new Error("Launcher private debug transport is not connected");
+    this.write({ type: "cdp", message });
+  }
+
+  close(): void {
+    this.finish("closed");
+  }
+}
+
+export async function connectLauncherDebugTransport(
+  descriptor: LauncherBrowserHostDescriptor,
+  surfaceId: string,
+  debugLeaseToken: string,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<LauncherDebugTransport> {
+  const leaseToken = assertDebugLeaseToken(debugLeaseToken);
+  return await new PrivateLauncherDebugTransport(
+    descriptor,
+    surfaceId,
+    leaseToken,
+    timeoutMs,
+    abortSignal,
+  ).authenticated();
+}
+
+export async function inspectLauncherBrowserHostLiveness(
+  descriptorPath: string,
+  options: {
+    expectedProfile?: LauncherBrowserHostProfile;
+    timeoutMs?: number;
+  } = {},
+): Promise<LauncherBrowserHostDescriptor> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  if (options.expectedProfile && descriptor.profile !== options.expectedProfile) {
+    throw new Error(
+      `Launcher browser belongs to ${descriptor.profile}, but ${options.expectedProfile} was required`,
+    );
+  }
+  return descriptor;
 }
 
 export async function selectLauncherPage(
@@ -202,17 +434,27 @@ export async function connectLauncherBrowserHost(
   descriptorPath: string,
   timeoutMs = 20_000,
   surfaceId?: string,
+  debugLeaseToken?: string,
   abortSignal?: AbortSignal,
 ): Promise<LauncherBrowserConnection> {
   if (abortSignal?.aborted) {
     throw new DOMException("Launcher browser connection aborted", "AbortError");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
-  await assertCdpReady(descriptor, Math.min(timeoutMs, 5_000));
+  const requestedSurfaceId = surfaceId ?? descriptor.surfaceId;
+  const authenticationTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, 5_000) : 5_000;
+  const transport = await connectLauncherDebugTransport(
+    descriptor,
+    requestedSurfaceId,
+    assertDebugLeaseToken(debugLeaseToken),
+    authenticationTimeoutMs,
+    abortSignal,
+  );
   let browser: Browser;
   try {
-    browser = await chromium.connectOverCDP(descriptor.endpoint, { timeout: timeoutMs });
+    browser = await chromium.connectOverCDP(transport, { timeout: timeoutMs, isLocal: true });
   } catch (error) {
+    transport.close();
     throw new Error(`Could not connect Playwright to the launcher browser: ${error instanceof Error ? error.message : String(error)}`);
   }
   const closeOnAbort = () => { void browser.close().catch(() => {}); };
@@ -225,7 +467,7 @@ export async function connectLauncherBrowserHost(
       browser,
       descriptor,
       timeoutMs,
-      surfaceId,
+      requestedSurfaceId,
       abortSignal,
     );
     return { descriptor, browser, context, page };
@@ -311,7 +553,13 @@ export type LauncherTurnActivity =
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
     }
-  | { phase: "heartbeat"; traceId: string; helperPid: number }
+  | {
+      phase: "heartbeat";
+      traceId: string;
+      helperPid: number;
+      /** Re-establish the launcher's hidden viewport after the caller closes its CDP session. */
+      refreshViewport?: boolean;
+    }
   | {
       phase: "end";
       traceId: string;
@@ -327,6 +575,181 @@ export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
 
+export interface LauncherManualTurnOwner {
+  traceId: string;
+  helperPid: number;
+}
+
+export interface LauncherManualTurnStart extends LauncherManualTurnOwner {
+  prompt: string;
+  /** Used only when the exact retained ChatGPT conversation already owns the accumulated history. */
+  resumePrompt?: string;
+  conversationKey?: string;
+}
+
+export interface LauncherManualTurnLease {
+  tabId: string;
+  reused: boolean;
+  deadlineAt: string | null;
+  state: "awaiting-user" | "sent" | "running" | "completed";
+}
+
+export interface LauncherManualTurnEnd extends LauncherManualTurnOwner {
+  status: "completed" | "failed" | "aborted";
+  retain?: boolean;
+}
+
+export interface LauncherManualTurnTerminal {
+  status: "cancelled" | "failed";
+}
+
+export const LAUNCHER_MANUAL_TURN_START_TIMEOUT_MS = 10_000;
+export const LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS = 40_000;
+export const LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS = 15_000;
+
+async function launcherManualRequest(
+  descriptor: LauncherBrowserHostDescriptor,
+  action: "start" | "wait-sent" | "wait-terminal" | "started" | "end" | "cancel",
+  body: LauncherManualTurnStart | LauncherManualTurnOwner | LauncherManualTurnEnd,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<{ response: Response; body: Record<string, unknown> }> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  abortSignal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(abort, timeoutMs);
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}/v1/manual/${action}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${descriptor.control.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const decoded = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return { response, body: decoded };
+  } finally {
+    clearTimeout(timer);
+    abortSignal?.removeEventListener("abort", abort);
+  }
+}
+
+function throwManualControlError(response: Response, body: Record<string, unknown>): never {
+  const message = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+  if (body.code === "turn_cancelled") throw new LauncherBrowserTurnCancelledError(message);
+  if (body.code === "manual_turn_timed_out") throw new LauncherManualTurnTimedOutError(message);
+  throw new LauncherManualTurnFailedError(message);
+}
+
+export async function startLauncherManualTurn(
+  descriptorPath: string,
+  activity: LauncherManualTurnStart,
+  timeoutMs = LAUNCHER_MANUAL_TURN_START_TIMEOUT_MS,
+): Promise<LauncherManualTurnLease> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const { response, body } = await launcherManualRequest(descriptor, "start", activity, timeoutMs);
+  if (!response.ok) throwManualControlError(response, body);
+  if (typeof body.tabId !== "string" || !body.tabId
+    || typeof body.reused !== "boolean"
+    || (body.deadlineAt !== null && (typeof body.deadlineAt !== "string" || Number.isNaN(Date.parse(body.deadlineAt))))
+    || !["awaiting-user", "sent", "running", "completed"].includes(String(body.state))) {
+    throw new LauncherManualTurnFailedError("Launcher returned an invalid manual turn lease");
+  }
+  return {
+    tabId: body.tabId,
+    reused: body.reused,
+    deadlineAt: body.deadlineAt as string | null,
+    state: body.state as LauncherManualTurnLease["state"],
+  };
+}
+
+export async function waitForLauncherManualSent(
+  descriptorPath: string,
+  owner: LauncherManualTurnOwner,
+  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<{ sentAt: string | null }> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const timeoutMs = options.timeoutMs ?? LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS;
+  for (;;) {
+    if (options.abortSignal?.aborted) throw new DOMException("Manual Sent wait aborted", "AbortError");
+    const { response, body } = await launcherManualRequest(
+      descriptor,
+      "wait-sent",
+      owner,
+      timeoutMs,
+      options.abortSignal,
+    );
+    if (response.status === 202 && body.status === "pending") continue;
+    if (!response.ok) throwManualControlError(response, body);
+    if (body.status !== "sent"
+      || (body.sentAt !== null && (typeof body.sentAt !== "string" || Number.isNaN(Date.parse(body.sentAt))))) {
+      throw new LauncherManualTurnFailedError("Launcher returned invalid manual Sent confirmation");
+    }
+    return { sentAt: body.sentAt as string | null };
+  }
+}
+
+export async function markLauncherManualTurnStarted(
+  descriptorPath: string,
+  owner: LauncherManualTurnOwner,
+  timeoutMs = LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS,
+): Promise<void> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const { response, body } = await launcherManualRequest(descriptor, "started", owner, timeoutMs);
+  if (!response.ok) throwManualControlError(response, body);
+}
+
+export async function waitForLauncherManualTerminal(
+  descriptorPath: string,
+  owner: LauncherManualTurnOwner,
+  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<LauncherManualTurnTerminal> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const timeoutMs = options.timeoutMs ?? LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS;
+  for (;;) {
+    if (options.abortSignal?.aborted) throw new DOMException("Manual terminal wait aborted", "AbortError");
+    const { response, body } = await launcherManualRequest(
+      descriptor,
+      "wait-terminal",
+      owner,
+      timeoutMs,
+      options.abortSignal,
+    );
+    if (response.status === 202 && body.status === "pending") continue;
+    if (!response.ok) throwManualControlError(response, body);
+    if (body.status !== "cancelled" && body.status !== "failed") {
+      throw new LauncherManualTurnFailedError("Launcher returned an invalid manual terminal signal");
+    }
+    return { status: body.status };
+  }
+}
+
+export async function endLauncherManualTurn(
+  descriptorPath: string,
+  activity: LauncherManualTurnEnd,
+  timeoutMs = LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS,
+): Promise<{ cancelledByUser: boolean }> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const { response, body } = await launcherManualRequest(descriptor, "end", activity, timeoutMs);
+  if (!response.ok) throwManualControlError(response, body);
+  if (typeof body.cancelledByUser !== "boolean") {
+    throw new LauncherManualTurnFailedError("Launcher returned an invalid manual turn release result");
+  }
+  return { cancelledByUser: body.cancelledByUser };
+}
+
+export async function cancelLauncherManualTurn(
+  descriptorPath: string,
+  owner: LauncherManualTurnOwner,
+  timeoutMs = LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS,
+): Promise<void> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  const { response, body } = await launcherManualRequest(descriptor, "cancel", owner, timeoutMs);
+  if (!response.ok) throwManualControlError(response, body);
+}
+
 export async function notifyLauncherTurn(
   descriptorPath: string,
   activity: LauncherTurnActivity,
@@ -337,6 +760,7 @@ export async function notifyLauncherTurn(
       : LAUNCHER_TURN_START_TIMEOUT_MS,
 ): Promise<{
   surfaceId?: string;
+  debugLeaseToken?: string;
   reused?: boolean;
   connectorBound?: boolean;
   cancelledByUser?: boolean;
@@ -380,8 +804,12 @@ export async function notifyLauncherTurn(
       if (typeof body.connectorBound !== "boolean") {
         throw new Error("Launcher browser control channel returned an invalid connector state");
       }
+      if (typeof body.debugLeaseToken !== "string" || !/^[A-Za-z0-9_-]{40,}$/.test(body.debugLeaseToken)) {
+        throw new Error("Launcher browser control channel returned an invalid private debug lease");
+      }
       return {
         surfaceId: body.surfaceId,
+        debugLeaseToken: body.debugLeaseToken,
         reused: body.reused,
         connectorBound: body.connectorBound,
       };

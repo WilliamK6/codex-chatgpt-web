@@ -356,7 +356,12 @@ function usageOf(response: ResponsesEnvelope): DevChatUsage {
 }
 
 export function defaultDevChatModel(config: AppConfig): DevChatModel {
+  if (config.browserInteractionMode === "manual") return "chatgpt-web/zero-risk";
   return config.solAvailable ? "chatgpt-web/light" : "chatgpt-web/luna";
+}
+
+function isLunaDevChatModel(model: DevChatModel): boolean {
+  return model === "chatgpt-web/luna" || model === "chatgpt-web/think";
 }
 
 export function prepareWorkingTreeBrowserHelper(): string | undefined {
@@ -418,6 +423,10 @@ export class DevChatDriver {
     const opened = this.store.loadOrCreate(name, model, this.cwd);
     if (resolve(opened.state.cwd) !== resolve(this.cwd)) {
       throw new Error(`DEV chat ${JSON.stringify(name)} belongs to ${opened.state.cwd}; use another name for ${this.cwd}`);
+    }
+    if (!opened.created && requestedModel && opened.state.model !== requestedModel) {
+      opened.state.model = requestedModel;
+      this.store.save(opened.state);
     }
     requireChatGptWebModelRoute(opened.state.model, this.config);
     this.assertBiggerContextModel(opened.state.model);
@@ -562,11 +571,11 @@ export class DevChatDriver {
   }
 
   private shouldAutoCompact(state: DevChatState, context: DevContextStatus): boolean {
-    return state.model !== "chatgpt-web/luna" && context.inputTokens >= context.autoCompactTokenLimit;
+    return !isLunaDevChatModel(state.model) && context.inputTokens >= context.autoCompactTokenLimit;
   }
 
   private assertBiggerContextModel(model: DevChatModel): void {
-    if (this.features.biggerContext && model === "chatgpt-web/luna") {
+    if (this.features.biggerContext && isLunaDevChatModel(model)) {
       throw new Error(
         "Bigger Context is unavailable for Luna because its accumulated browser transcript still shares one 28,000-token transport budget",
       );
@@ -610,7 +619,7 @@ export class DevChatDriver {
     reason: "automatic" | "manual",
     emit: (event: DevChatEvent) => void,
   ): Promise<unknown[]> {
-    if (state.model === "chatgpt-web/luna") {
+    if (isLunaDevChatModel(state.model)) {
       throw new Error("ChatGPT Web Luna uses its production rolling checkpoint and does not support a separate compact command");
     }
     const compactTurnId = id("dev_compact_turn");

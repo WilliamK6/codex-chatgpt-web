@@ -45,7 +45,7 @@ async function localHealthServer(statusForPath = () => 200, bodyForPath = () => 
 function launcherConfig(descriptorPath, overrides = {}) {
   const root = path.dirname(descriptorPath);
   return {
-    version: 3,
+    version: 4,
     releaseVersion: "0.2.0",
     mode: "browser-only",
     host: "127.0.0.1",
@@ -63,6 +63,7 @@ function launcherConfig(descriptorPath, overrides = {}) {
     proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
+    responsesToken: "runtime-supervisor-responses-token-0123456789abcdef",
     runtimeCommand: [process.execPath],
     ...overrides,
   };
@@ -148,6 +149,14 @@ test("launcher runtime ownership cannot cross production and DEV profiles", () =
     () => validateConfig({ ...production, subagentProtocol: "v0" }, descriptorPath),
     /invalid subagent protocol/,
   );
+  assert.throws(
+    () => validateConfig({ ...production, stallTimeoutSec: 0 }, descriptorPath),
+    /invalid stallTimeoutSec/,
+  );
+  assert.equal(
+    validateConfig({ ...production, stallTimeoutSec: 900 }, descriptorPath).stallTimeoutSec,
+    900,
+  );
 });
 
 test("DEV runtime supervision ignores launcher version mismatch and starts only the isolated MCP tunnel", async () => {
@@ -228,7 +237,7 @@ test("launcher runtime validation rejects a relative full-mode executable before
 test("launcher runtime validation accepts native Windows paths and a named pipe", () => {
   const descriptorPath = "C:\\Users\\Example\\AppData\\Local\\Codex Web GPT\\launcher-browser.json";
   const config = {
-    version: 3,
+    version: 4,
     releaseVersion: "0.2.0",
     mode: "browser-only",
     host: "127.0.0.1",
@@ -245,6 +254,7 @@ test("launcher runtime validation accepts native Windows paths and a named pipe"
     proAvailable: true,
     autoApproveToolCalls: false,
     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
+    responsesToken: "runtime-supervisor-responses-token-0123456789abcdef",
     runtimeCommand: ["C:\\Users\\Example\\.codex-chatgpt-web\\runtime\\bun.exe"],
   };
   assert.equal(validateConfig(config, descriptorPath, "win32"), config);
@@ -807,6 +817,72 @@ test("tunnel recovery replaces a false-green managed runtime and proves the fres
       "monitor",
     ]);
     assert.equal(supervisor.tunnel?.pid, 123_456_779);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh tunnel recovery discovers its official loopback diagnostics before probing MCP", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-health-discovery-"));
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  const config = {
+    tunnel: {
+      alias: "codex-chatgpt-web",
+      binaryPath: path.join(root, "tunnel-client"),
+      profileDir: root,
+    },
+  };
+  const commands = [];
+  supervisor.runTunnelCommand = async (_config, args) => {
+    commands.push(args);
+    return {
+      code: 0,
+      output: JSON.stringify({
+        local: { health: { base_url: "http://127.0.0.1:43127" } },
+      }),
+    };
+  };
+  supervisor.probeTunnelMcpTransport = async () => ({
+    observed: true,
+    ok: true,
+    fatal: false,
+    detail: "MCP transport has no recent internal failures",
+  });
+  try {
+    await supervisor.waitForTunnelMcpTransport(config, 25);
+    assert.equal(supervisor.tunnelHealthBaseUrl, "http://127.0.0.1:43127");
+    assert.deepEqual(commands, [["runtimes", "status", "codex-chatgpt-web", "--json"]]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tunnel diagnostics discovery rejects a non-loopback endpoint", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-health-nonlocal-"));
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  supervisor.runTunnelCommand = async () => ({
+    code: 0,
+    output: JSON.stringify({ health_url: "https://example.com/healthz" }),
+  });
+  try {
+    await assert.rejects(
+      supervisor.discoverTunnelHealthBaseUrl({
+        tunnel: { alias: "codex-chatgpt-web", binaryPath: path.join(root, "tunnel-client"), profileDir: root },
+      }),
+      /no verified loopback endpoint/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

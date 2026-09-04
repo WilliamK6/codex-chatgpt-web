@@ -3,6 +3,10 @@ import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worke
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
+import {
+  cancelAllStructuredCompactions,
+  cancelStructuredCompactionTrace,
+} from "./adapters/chatgpt-web/compaction-handoff";
 import { chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE } from "./adapters/chatgpt-web/environment";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
@@ -38,7 +42,27 @@ import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
 
-type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified";
+type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "images" | "unspecified";
+
+function capabilityMatches(expected: string, supplied: string): boolean {
+  const wanted = Buffer.from(expected);
+  const actual = Buffer.from(supplied);
+  return wanted.length === actual.length && timingSafeEqual(wanted, actual);
+}
+
+/**
+ * Returns the logical `/v1/...` path for a valid local capability, `null` for a functional
+ * Responses path with a missing/wrong capability, and `undefined` for unrelated paths.
+ */
+export function authenticatedResponsesPath(
+  pathname: string,
+  responsesToken: string,
+): string | null | undefined {
+  if (pathname === "/v1" || pathname.startsWith("/v1/")) return null;
+  const match = /^\/([^/]+)(\/v1(?:\/.*)?)$/.exec(pathname);
+  if (!match) return undefined;
+  return capabilityMatches(responsesToken, match[1]!) ? match[2]! : null;
+}
 
 export interface HttpStreamFailureEvidence {
   httpTurnId: number;
@@ -283,7 +307,11 @@ export interface ResponseRequestOptions {
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
   const route = requireChatGptWebModelRoute(parsed.modelId, config);
   parsed.modelId = route.backendModel;
-  parsed.options.reasoning = route.adapterEffort;
+  // Zero Risk preserves a distinct backend identity. Its immutable Codex effort is only a
+  // protocol/catalog value; the manual adapter must never reinterpret it as a ChatGPT selection.
+  parsed.options.reasoning = route.interactionMode === "automatic"
+    ? route.adapterEffort
+    : route.codexEffort;
   return route;
 }
 
@@ -321,6 +349,18 @@ export async function nativeSearchRequest(
 ): Promise<Response> {
   try {
     return await forwardNativeCodexRequest(req, "alpha/search", fetchUpstream);
+  } catch (error) {
+    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+  }
+}
+
+export async function nativeImageRequest(
+  req: Request,
+  endpoint: "images/edits" | "images/generations",
+  fetchUpstream?: NativeFetch,
+): Promise<Response> {
+  try {
+    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -485,6 +525,9 @@ export async function responseRequest(
       2_000,
       {
         hideThinkingSummary: parsed.options.hideThinkingSummary,
+        ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
+          ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
+          : {}),
         ...(compaction ? { compaction: true } : {
           ...(options.rememberState === false ? {} : {
             onCompletedResponse: (response: Record<string, unknown>) => rememberResponseState(parsed._rawBody, response, { force: true }),
@@ -697,24 +740,41 @@ export function startServer(
           );
         }
         const reason = chatGptBrowserTabClosedError();
-        const cancelledBrowserTurns = await chatGptTurnSessions.cancelTrace(traceId, reason);
+        // Revoke the owner first. This prevents a compaction callback that observes its retained
+        // source being cancelled below from starting a fresh fallback during operator shutdown.
+        const compactionCancellation = cancelStructuredCompactionTrace(traceId, reason);
+        const browserCancellation = chatGptTurnSessions.cancelTrace(traceId, reason);
+        const [cancelledBrowserTurns, cancelledCompactionRuns] = await Promise.all([
+          browserCancellation,
+          compactionCancellation,
+        ]);
         const cancelledBrokerTurns = turnBroker?.revokeTrace(traceId, reason) ?? 0;
         return Response.json({
           status: "ok",
           trace_id: traceId,
           cancelled_browser_turns: cancelledBrowserTurns,
           cancelled_broker_turns: cancelledBrokerTurns,
+          cancelled_compaction_runs: cancelledCompactionRuns,
           ...activity(),
         });
       }
       if (req.method === "POST" && url.pathname === "/admin/cancel-turns") {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        const reason = new Error("Active turn cancelled by launcher");
+        // Abort shared compaction owners before clearing their retained source sessions. The
+        // owner signal is the only cancellation boundary for a fresh fallback not in the session
+        // registry.
+        const compactionCancellation = cancelAllStructuredCompactions(reason);
         const cancelledBrowserTurns = chatGptTurnSessions.clear() + (turnBroker?.revokeExternalOwners() ?? 0);
-        const cancelledHttpTurns = await httpTurns.cancelAll(new Error("Active turn cancelled by launcher"));
+        const [cancelledHttpTurns, cancelledCompactionRuns] = await Promise.all([
+          httpTurns.cancelAll(reason),
+          compactionCancellation,
+        ]);
         return Response.json({
           status: "ok",
           cancelled_http_turns: cancelledHttpTurns,
           cancelled_browser_turns: cancelledBrowserTurns,
+          cancelled_compaction_runs: cancelledCompactionRuns,
           ...activity(),
         });
       }
@@ -734,7 +794,10 @@ export function startServer(
         setTimeout(shutdown, 0);
         return Response.json({ status: "ok", accepting_turns: false, ...current });
       }
-      if (req.method === "GET" && url.pathname === "/v1/models") {
+      const routePath = authenticatedResponsesPath(url.pathname, config.responsesToken);
+      if (routePath === null) return new Response("Not found", { status: 404 });
+      if (routePath === undefined) return new Response("Not found", { status: 404 });
+      if (req.method === "GET" && routePath === "/v1/models") {
         if (draining) {
           return formatErrorResponse(
             503,
@@ -769,13 +832,13 @@ export function startServer(
           return response;
         }, req.signal, process.platform, "models");
       }
-      if (req.method === "GET" && url.pathname === "/v1/responses") {
+      if (req.method === "GET" && routePath === "/v1/responses") {
         return new Response("Responses WebSocket transport is not enabled on this local route", {
           status: 426,
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
       }
-      if (req.method === "POST" && url.pathname === "/v1/responses") {
+      if (req.method === "POST" && routePath === "/v1/responses") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => responseRequest(new Request(req, { signal }), config),
@@ -784,7 +847,7 @@ export function startServer(
           "responses",
         );
       }
-      if (req.method === "POST" && url.pathname === "/v1/responses/compact") {
+      if (req.method === "POST" && routePath === "/v1/responses/compact") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => compactRequest(new Request(req, { signal }), config),
@@ -793,13 +856,25 @@ export function startServer(
           "compact",
         );
       }
-      if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
+      if (req.method === "POST" && routePath === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),
           req.signal,
           process.platform,
           "search",
+        );
+      }
+      if (req.method === "POST" && (
+        routePath === "/v1/images/edits" || routePath === "/v1/images/generations"
+      )) {
+        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        const endpoint = routePath === "/v1/images/edits" ? "images/edits" : "images/generations";
+        return httpTurns.track(
+          signal => nativeImageRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream),
+          req.signal,
+          process.platform,
+          "images",
         );
       }
       return new Response("Not found", { status: 404 });

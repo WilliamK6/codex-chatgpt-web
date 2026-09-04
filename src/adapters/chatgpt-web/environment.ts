@@ -97,6 +97,29 @@ function contextualUserMessage(value: Record<string, unknown>): boolean {
     || text === OPAQUE_COMPACTION_NOTE;
 }
 
+function isTurnAbortedNotice(value: Record<string, unknown>): boolean {
+  return /^<turn_aborted>[\s\S]*<\/turn_aborted>$/.test(rawMessageText(value).trim());
+}
+
+/** Native turn ids that Codex has authoritatively marked as interrupted in this thread. */
+export function priorChatGptAbortedTurnIds(parsed: CodexParsedRequest): string[] {
+  const currentTurnId = extractChatGptTurnIdentity(parsed).turnId;
+  if (!currentTurnId) return [];
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  return [...new Set(input.flatMap(value => {
+    const item = record(value);
+    const abortedTurnId = item ? itemTurnId(item) : undefined;
+    return item?.type === "message"
+      && item.role === "user"
+      && isTurnAbortedNotice(item)
+      && abortedTurnId !== undefined
+      && abortedTurnId !== currentTurnId
+      ? [abortedTurnId]
+      : [];
+  }))];
+}
+
 /**
  * Return the latest real user instruction owned by the current native Codex turn.
  *
@@ -108,7 +131,7 @@ function contextualUserMessage(value: Record<string, unknown>): boolean {
 export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unknown {
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   if (!turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
-  const revision = latestChatGptTurnUserRevision(parsed);
+  const revision = latestChatGptTurnUserRevision(parsed, turnId);
   if (!revision) throw new Error("ChatGPT web requires a current-turn user message for browser-session replay");
   if (revision.turnId !== undefined && revision.turnId !== turnId) {
     throw new Error(CHATGPT_TURN_REVISION_CONFLICT_MESSAGE);
@@ -116,14 +139,21 @@ export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unkn
   return revision.content;
 }
 
-function latestChatGptTurnUserRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision | undefined {
+function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string): ChatGptTurnUserRevision | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const item = record(input[index]);
     if (item?.type !== "message" || item.role !== "user") continue;
-    if (contextualUserMessage(item)) continue;
     const messageTurnId = itemTurnId(item);
+    // Codex appends an abort report as a user-shaped item carrying the interrupted turn's id. Only
+    // suppress that synthetic notice when its metadata proves it belongs to a different turn; a
+    // human is still allowed to submit the same XML-looking text as their current instruction.
+    if (isTurnAbortedNotice(item)
+      && expectedTurnId !== undefined
+      && messageTurnId !== undefined
+      && messageTurnId !== expectedTurnId) continue;
+    if (contextualUserMessage(item)) continue;
     const serverOwnedId = typeof item.id === "string" && item.id.length > 0;
     if (messageTurnId === undefined && !serverOwnedId) continue;
     return { content: item.content, ...(messageTurnId ? { turnId: messageTurnId } : {}) };
@@ -134,7 +164,7 @@ function latestChatGptTurnUserRevision(parsed: CodexParsedRequest): ChatGptTurnU
 /** The human instruction summarized by a remote compaction request belongs to an earlier turn. */
 export function extractChatGptCompactionSourceRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision {
   if (!parsed._compactionRequest) throw new Error("ChatGPT web compaction source requires a compaction request");
-  const revision = latestChatGptTurnUserRevision(parsed);
+  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId);
   if (!revision) throw new Error("ChatGPT web compaction requires a source user message");
   return revision;
 }
@@ -448,7 +478,23 @@ function decodeXmlText(value: string): string {
 function environmentCwdMatches(text: string, preferredRoots: string[] = []): string[] {
   const sections = [...text.matchAll(/<environments>([\s\S]*?)<\/environments>/gi)];
   if (sections.length === 0) {
-    return [...text.matchAll(/<cwd>([^<]+)<\/cwd>/gi)].map(match => match[1] ?? "");
+    const cwdMatches = [...text.matchAll(/<cwd>([^<]+)<\/cwd>/gi)].map(match => match[1] ?? "");
+    if (cwdMatches.length > 0 || /<\/?cwd\b/i.test(text)) return cwdMatches;
+
+    // Codex Desktop 0.150+ can emit a filesystem-only environment diff when an existing task is
+    // rebound to another model. Its ordered multi-folder contract uses the first workspace root as
+    // the task's working directory and the remaining roots as additional filesystem authority.
+    // Recover only that exact cwd-less shape; malformed cwd markup and multi-environment payloads
+    // continue to fail closed.
+    const rootSections = [...text.matchAll(/<workspace_roots>[\s\S]*?<\/workspace_roots>/gi)];
+    if (rootSections.length !== 1) return [];
+    const rootSection = rootSections[0]![0];
+    const roots = [...rootSection.matchAll(/<root>([^<]+)<\/root>/gi)]
+      .map(match => match[1] ?? "");
+    const rootOpenings = [...rootSection.matchAll(/<root\b[^>]*>/gi)];
+    const rootClosings = [...rootSection.matchAll(/<\/root\s*>/gi)];
+    if (rootOpenings.length !== roots.length || rootClosings.length !== roots.length) return [];
+    return roots.length > 0 ? [roots[0]!] : [];
   }
   if (sections.length !== 1) return [];
 

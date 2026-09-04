@@ -30,12 +30,22 @@ export interface CodexContext {
 
 export type CodexMessage =
   | CodexUserMessage
+  | CodexAgentMessage
   | CodexAssistantMessage
   | CodexDeveloperMessage
   | CodexToolResultMessage;
 
 export interface CodexUserMessage {
   role: "user";
+  content: string | CodexContentPart[];
+  timestamp: number;
+}
+
+/** A readable MultiAgent message delivered between native Codex agents. */
+export interface CodexAgentMessage {
+  role: "agentMessage";
+  author?: string;
+  recipient?: string;
   content: string | CodexContentPart[];
   timestamp: number;
 }
@@ -134,6 +144,15 @@ export type CodexToolChoice =
   | { name: string }
   | { allowedTools: string[]; mode: "auto" | "required" };
 
+export type CodexVerbosity = "low" | "medium" | "high";
+
+export interface CodexJsonSchemaOutputFormat {
+  type: "json_schema";
+  name: string;
+  strict: boolean;
+  schema: unknown;
+}
+
 export interface CodexRequestOptions {
   maxOutputTokens?: number;
   temperature?: number;
@@ -146,6 +165,10 @@ export interface CodexRequestOptions {
   serviceTier?: string;
   presencePenalty?: number;
   frequencyPenalty?: number;
+  /** Native Responses text verbosity requested by Codex. */
+  verbosity?: CodexVerbosity;
+  /** Native Responses JSON-schema output contract requested by Codex. */
+  outputFormat?: CodexJsonSchemaOutputFormat;
   /** Responses prompt-cache affinity key. Passthrough preserves it via _rawBody; routed adapters do not consume it unless their upstream wire supports it. */
   promptCacheKey?: string;
 }
@@ -239,6 +262,8 @@ export interface CodexProviderConfig {
   chatgptWeb?: {
     /** ChatGPT custom connector attached to tool-capable temporary chats. */
     appName?: string;
+    /** Whether ChatGPT DOM interaction is automatic or explicitly driven by the user. */
+    browserInteractionMode?: "automatic" | "manual";
     /** Explicit browser owner. Launcher mode attaches to the embedded Electron ChatGPT surface. */
     browserHost?: "managed-chrome" | "launcher";
     /** Owner-only descriptor containing the launcher's loopback CDP and control endpoints. */
@@ -259,6 +284,13 @@ export interface CodexProviderConfig {
     lunaCheckpointStatePath?: string;
     /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
+    /**
+     * Seconds of adapter silence before the Responses bridge cancels a turn as a hung upstream.
+     * The adapter heartbeats every CHATGPT_WEB_ADAPTER_HEARTBEAT_MS for the whole of a turn, so a
+     * healthy turn never approaches this no matter how long it thinks; raise it only to tolerate a
+     * genuinely unresponsive upstream for longer. Defaults to DEFAULT_STALL_TIMEOUT_SEC.
+     */
+    stallTimeoutSec?: number;
     /** Keep the single controlled browser visible. */
     headed?: boolean;
     /** Attach the turn-bound Codex MCP capability for every connector-capable Web model. */

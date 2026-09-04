@@ -8,16 +8,29 @@ created. Repository contents, tool output, websites, and prompt text are untrust
 
 ## Full-mode capability flow
 
-1. The daemon accepts a Codex Responses turn on `127.0.0.1`.
+1. The daemon accepts a Codex Responses turn on `127.0.0.1` only when the request path contains the
+   persistent Responses capability installed in Codex's managed `openai_base_url`.
 2. It extracts `cwd`, workspace roots, sandbox policy, and the tool registry only from the native
    Codex wire envelope with matching turn metadata. A user-authored `<environment_context>` is not
    accepted as authority.
 3. It creates a random, turn-scoped token and embeds it in that one ChatGPT browser prompt.
 4. Every Codex Native action presents that same turn token. The MCP handler idempotently claims an
-   internal binding and immediately dispatches the requested action; the binding is never exposed
-   to the model. Both handles are revoked when the turn completes, aborts, or expires.
-5. MCP can request only a tool advertised by the active outer Codex turn. Codex remains responsible
-   for its sandbox, approval, UI, command sessions, and tool result.
+   internal binding plus a request-scoped activity lease and immediately dispatches the requested
+   action; neither internal handle is exposed to the model. The lease is settled only after the MCP
+   handler finishes, including inventory calls that need no outer Codex tool.
+5. MCP can request only a callable tool advertised by the active outer Codex turn. The unrestricted
+   raw orchestration `exec` gateway remains available in Full mode. Before caller-authored
+   JavaScript runs, the bridge wraps its tool registry with a transparent proxy that enforces the
+   exact 10-second `wait_agent` polling contract and prevents recursive raw `exec`. The generic
+   inventory/call pair also provides a structured exact-name path. Codex remains responsible for
+   its sandbox, approval, UI, command sessions, and tool result.
+6. Before a Codex tool batch is dispatched, the browser records and acknowledges the current answer
+   projection. Completion stays blocked while the tool is unresolved and then requires a new stable
+   final-answer projection after that causal boundary. A two-phase broker fence then rereads the DOM
+   and commits completion only if the activity revision stayed unchanged with no active invocation;
+   a concurrent claim makes the candidate lose, while a claim after commit receives an explicit
+   terminal rejection. Recent MCP activity may suppress a false DOM-health failure but never adds
+   an idle delay to a successful completion.
 
 The bridge transports decisions; it does not add a second planner, semantic router, or fallback
 model. Every available effort uses the same MCP contract. An unavailable account route, missing
@@ -43,6 +56,15 @@ current OS user's private application-data directory and is never copied into a 
 runtime descriptor. Never sync, upload, attach, or commit it. On suspected exposure, sign out or
 revoke the ChatGPT session from the launcher.
 
+The launcher does not enable Electron/Chromium's raw remote-debugging port. Browser helpers instead
+authenticate to an application-owned, framed loopback broker with a separate random debug
+capability plus an operation/turn capability that never appears in the persistent descriptor. The
+broker resolves only the exact launcher surface leased to that helper process, revalidates the lease
+before each command, and revokes live attachments on completion, removal, or reassignment. It does
+not expose browser-wide target discovery, cookie mutation, storage access, or control. This keeps
+Playwright-based automation without publishing a generic DevTools endpoint to other local
+applications.
+
 ### Tunnel credential theft
 
 The runtime key needs only Tunnels Read + Use. It is accepted through a hidden prompt or copied
@@ -51,24 +73,38 @@ argument or generated profile. Rotate it after suspected exposure.
 
 ### Same-user local process
 
-The Responses endpoint is loopback-only, but it has no independent bearer secret because the
-built-in Codex OpenAI provider cannot be configured with a bridge-specific credential while
-preserving the native provider/task identity. Another process under the same OS user can reach the
-port. Run on a trusted single-user account and treat local code execution as inside the trust
-boundary.
+The Responses endpoint is loopback-only and every functional `/v1` route is below a random,
+persistent path capability. Setup installs that capability in the managed `openai_base_url`; it is
+distinct from the lifecycle-control bearer and the launcher's browser-debug capability. The daemon
+checks it before reading a request body, allocating turn state, or forwarding upstream. Native
+Codex `Authorization` headers remain untouched so official-model passthrough keeps the original
+provider and task identity.
 
-The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
-`/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
-user-only application config. The launcher uses them to reject new work, prove that both the HTTP
-request and long-lived browser/tool loop are idle, flush response state, and stop a process. The
-token does not turn loopback into a hostile-local-process security boundary; it prevents accidental
-or unauthenticated lifecycle control through ordinary requests.
+The capability prevents an ordinary unauthenticated local request from using the bridge, but it is
+not a boundary against arbitrary code already running as the same OS user. Such a process may be
+able to read the owner-only application config, Codex config, or browser profile and recover the
+capability or session. Run on a trusted single-user account, keep these files private, and treat
+same-UID code execution as inside the trust boundary.
+
+`/healthz` remains public on loopback so the launcher and doctor can determine readiness without
+receiving either secret. Lifecycle endpoints are separate from both health and Responses:
+`/admin/drain`, `/admin/resume`, `/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown`
+require the distinct random control bearer stored in the user-only application config. The launcher
+uses them to reject new work, prove that both the HTTP request and long-lived browser/tool loop are
+idle, flush response state, and stop a process. The token does not turn loopback into a
+hostile-same-UID security boundary; it prevents accidental or unauthenticated lifecycle control
+through ordinary requests.
+
+Never paste the Responses path capability, control bearer, browser-debug capability, or a complete
+managed `openai_base_url` into a chat, issue, terminal transcript, or diagnostic report. Logs and
+status output redact capability-bearing routes; local config, route journals, and their backups must
+retain owner-only permissions.
 
 ### Browser/UI drift
 
-ChatGPT DOM and labels are not a stable API. Selectors are narrow and completion requires stable
-completed-turn evidence. UI drift fails the turn; it never chooses another model, starts another
-transport, or returns a fabricated success.
+ChatGPT DOM and labels are not a stable API. Selectors are narrow; Full-mode completion requires
+stable completed-turn evidence and, after tools, a new final-answer projection. UI drift fails the
+turn; it never chooses another model, starts another transport, or returns a fabricated success.
 
 ### Login-state isolation
 
@@ -94,7 +130,10 @@ assistant prose as a structured handoff.
 
 ## Network exposure
 
-- Responses and health listeners bind to `127.0.0.1` only.
+- Responses and health listeners bind to `127.0.0.1` only. Functional Responses paths require the
+  persistent route capability, `/healthz` is public, and `/admin/*` uses the separate control bearer.
+- Browser automation uses the launcher's authenticated private debug broker on loopback; the app
+  does not publish Chromium's raw DevTools discovery/control port.
 - Full mode uses OpenAI's outbound HTTPS Secure MCP Tunnel; it opens no public listener or inbound
   firewall rule.
 - The embedded browser connects to ChatGPT, the selected identity provider during explicit sign-in,

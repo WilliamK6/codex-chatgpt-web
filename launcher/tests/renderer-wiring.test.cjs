@@ -42,6 +42,34 @@ test("closing the launcher follows the persisted background-runtime preference",
   assert.match(appSource, /setPreference\("keepRunningOnClose", checked\)/);
 });
 
+test("a foreground launch request survives hidden startup until the launcher window is ready", () => {
+  const showMainWindow = electronMain.slice(
+    electronMain.indexOf("function showMainWindow()"),
+    electronMain.indexOf("async function openWebUrl"),
+  );
+  assert.match(
+    showMainWindow,
+    /mainWindowShowRequested = true;[\s\S]*?!mainWindowReadyToShow[\s\S]*?mainWindowShowRequested = false;/,
+  );
+
+  const readyHandler = electronMain.slice(
+    electronMain.indexOf('window.once("ready-to-show"'),
+    electronMain.indexOf("trackWindowState(window", electronMain.indexOf('window.once("ready-to-show"')),
+  );
+  assert.match(
+    readyHandler,
+    /mainWindowReadyToShow = true;[\s\S]*?if \(mainWindowShowRequested\) showMainWindow\(\);/,
+  );
+
+  const secondInstance = electronMain.indexOf('app.on("second-instance", () => showMainWindow())');
+  const runtimeMaterialization = electronMain.indexOf("await waitForPackagedRuntimeSource", secondInstance);
+  assert.ok(secondInstance >= 0, "the second-instance foreground request must be registered");
+  assert.ok(
+    runtimeMaterialization > secondInstance,
+    "the foreground request must be registered before packaged-runtime startup can block window creation",
+  );
+});
+
 test("normal shutdown persists the ChatGPT session before closing browser views", () => {
   assert.match(
     electronMain,
@@ -53,6 +81,30 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
   assert.ok(destroy > persist, "browser views must close only after session persistence completes");
 });
 
+test("packaged runtime is verified before launcher browser surfaces can bind ports", () => {
+  assert.match(electronMain, /const net = require\("node:net"\);/);
+  assert.match(
+    electronMain,
+    /function findFreePort\(\) \{[\s\S]*?net\.createServer\(\)[\s\S]*?server\.listen\(0, "127\.0\.0\.1"/,
+  );
+  const start = electronMain.indexOf("async function start()");
+  const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);
+  const cdpPortAllocation = electronMain.indexOf("cdpPort = await findFreePort();", start);
+  const windowCreation = electronMain.indexOf("mainWindow = createWindow({", start);
+  const controlServerStart = electronMain.indexOf("browserControl = await new BrowserControlServer({", start);
+  const browserReady = electronMain.indexOf("await browserHost.ready();", start);
+
+  assert.ok(runtimeValidation > start, "startup must eagerly verify the packaged runtime");
+  for (const [surface, position] of [
+    ["CDP port allocation", cdpPortAllocation],
+    ["launcher window", windowCreation],
+    ["browser control server", controlServerStart],
+    ["embedded browser", browserReady],
+  ]) {
+    assert.ok(position > runtimeValidation, `${surface} must start only after runtime verification`);
+  }
+});
+
 test("DEV launcher exposes its profile and supervises only its Full-mode MCP runtime", () => {
   assert.match(electronMain, /profile:\s*LAUNCHER_PROFILE\.kind/);
   assert.match(electronMain, /if \(IS_DEV_PROFILE\) \{[\s\S]*?config\?\.mode === "full"[\s\S]*?runtimeSupervisor\.startIfConfigured\(\)[\s\S]*?\} else void \(async \(\) => \{/);
@@ -62,16 +114,30 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
   assert.match(electronMain, /onboardingComplete:\s*true,[\s\S]*?autoStart:\s*false/);
   assert.match(appSource, /snapshot\.profile === "development"/);
   assert.match(appSource, /data-profile=\{snapshot\.profile\}/);
-  assert.match(appSource, /<SettingRow body=\{copy\.biggerContextBody\} label=\{copy\.biggerContext\}>/);
+  assert.match(appSource, /manualBiggerContextUnavailable[\s\S]*?copy\.biggerContextBody/);
   assert.match(appSource, /api!\.setBiggerContext\(enabled\)/);
   assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true\)/);
   assert.doesNotMatch(electronMain, /IS_DEV_PROFILE && key === "experimentalBiggerContext"/);
 });
 
+test("macOS passkey sign-in is additive to the unchanged embedded login action", () => {
+  assert.match(appSource, /onAction=\{openLogin\}/);
+  assert.match(appSource, /<BrowserSurface[\s\S]*?operation=\{operation\}[\s\S]*?platform=\{snapshot\.platform\}/);
+  assert.match(appSource, /const passkeyAvailable = !manualInteraction[\s\S]*?platform === "darwin"[\s\S]*?browser\?\.authenticated !== true/);
+  assert.match(appSource, /\{passkeyAvailable \? \([\s\S]*?className="toolbar-text-button"[\s\S]*?copy\.passkeySignIn/);
+  assert.match(appSource, /className="browser-empty-actions"[\s\S]*?copy\.passkeySignIn/);
+  assert.match(appSource, /passkeyWaiting \? continuePasskeyLogin : openPasskeyLogin/);
+  assert.match(preloadSource, /openPasskeyLogin:[\s\S]*?launcher:browser-passkey-login/);
+  assert.match(preloadSource, /continuePasskeyLogin:[\s\S]*?launcher:browser-passkey-login-continue/);
+  assert.match(electronMain, /launcher:browser-passkey-login[\s\S]*?browserHost\.openPasskeyLogin\(\)/);
+  assert.match(electronMain, /loginWithPasskey: \(\) => runtimeHost\.capturePasskeyLogin\(\)/);
+  assert.match(browserHostSource, /await this\.waitForAuthenticated\(60_000\)[\s\S]*?runSessionInspection\(false\)/);
+});
+
 test("Bigger Context startup recommendation reuses the persisted setting and setup transaction", () => {
   assert.match(
     appSource,
-    /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\(\s*snapshot\.state\.coreSetupComplete === true && !snapshot\.state\.experimentalBiggerContext,/,
+    /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\([\s\S]*?snapshot\.state\.browserInteractionMode === "automatic"[\s\S]*?snapshot\.state\.coreSetupComplete === true[\s\S]*?!snapshot\.state\.experimentalBiggerContext,/,
   );
   assert.match(appSource, /&& !biggerContextRecommendationOpen;/);
   assert.match(appSource, /updateState\(await api!\.setBiggerContext\(enabled\)\)/);
@@ -82,7 +148,83 @@ test("Bigger Context startup recommendation reuses the persisted setting and set
   assert.match(appSource, /<Switch checked=\{checked\} disabled=\{busy\} onChange=\{onChange\} \/>/);
   assert.match(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*position:\s*fixed;/s);
   assert.doesNotMatch(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*backdrop-filter:/s);
-  assert.match(stylesSource, /\.bigger-context-recommendation\s*\{[^}]*width:\s*min\(400px, 100%\);[^}]*padding:\s*18px;/s);
+});
+
+test("Zero Risk is selectable during onboarding and later switches transactionally without automating its tab DOM", () => {
+  const setupSource = appSource.slice(
+    appSource.indexOf("function SetupSurface("),
+    appSource.indexOf("function McpSurface("),
+  );
+  assert.doesNotMatch(setupSource, /setBrowserInteractionMode|InteractionModeControl/);
+  assert.match(
+    appSource,
+    /function InteractionModePicker[\s\S]*?onChange\("automatic"\)[\s\S]*?onChange\("manual"\)/,
+  );
+  assert.match(appSource, /mode === "automatic" \? \([\s\S]*?className="interaction-mode-check"[\s\S]*?: null/);
+  assert.match(appSource, /mode === "manual" \? \([\s\S]*?className="interaction-mode-check"[\s\S]*?: null/);
+  assert.match(
+    stylesSource,
+    /\.interaction-mode-picker > button\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*\}[\s\S]*?\.interaction-mode-picker > button\.is-selected\s*\{[^}]*grid-template-columns:\s*18px minmax\(0, 1fr\);/,
+  );
+  assert.match(appSource, /useState<BrowserInteractionMode>\([\s\S]*?snapshot\.state\.browserInteractionMode/);
+  assert.match(appSource, /className="welcome-interaction-mode-picker"[\s\S]*?onChange=\{setSelectedInteractionMode\}/);
+  assert.match(appSource, /completeOnboarding\(selectedLanguage, selectedInteractionMode\)/);
+  assert.match(preloadSource, /completeOnboarding: \(language, browserInteractionMode\)[\s\S]*?launcher:complete-onboarding/);
+  assert.match(electronMain, /launcher:complete-onboarding[\s\S]*?validateBrowserInteractionMode\(rawInteractionMode\)/);
+  assert.match(appSource, /firstRunZeroRiskSetup \? "mcp"/);
+  assert.match(appSource, /api!\.setBrowserInteractionMode\(mode\)/);
+  assert.match(preloadSource, /launcher:browser-interaction-mode/);
+  assert.match(preloadSource, /launcher:manual-prompt-copy/);
+  assert.match(preloadSource, /launcher:manual-prompt-sent/);
+  assert.match(electronMain, /browserInteractionMode === "automatic"[\s\S]*?browserHost\.probeAuthentication/);
+  assert.match(electronMain, /browserInteractionMode === "automatic"[\s\S]*?smokePassedForCurrentVersion/);
+  const modeSwitchHandler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:browser-interaction-mode"'),
+    electronMain.indexOf('handle("launcher:set-preference"'),
+  );
+  const modeTransaction = modeSwitchHandler.indexOf("await browserHost.withInteractionModeChange(");
+  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode)");
+  const stateModeCommit = modeSwitchHandler.indexOf("const state = stateStore.update({");
+  assert.ok(modeTransaction >= 0 && modeTransaction < runtimeModeCommit);
+  assert.ok(runtimeModeCommit < stateModeCommit);
+
+  const mcpSetupHandler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:setup-mcp"'),
+    electronMain.indexOf('handle("launcher:set-mcp-step"'),
+  );
+  const runtimeMcpCommit = mcpSetupHandler.indexOf("const runSetup = () => setup({");
+  const mcpTransaction = mcpSetupHandler.indexOf("await browserHost.withInteractionModeChange(interactionMode, runSetup)");
+  const stateMcpCommit = mcpSetupHandler.indexOf("const state = stateStore.update({");
+  assert.ok(runtimeMcpCommit >= 0 && runtimeMcpCommit < mcpTransaction);
+  assert.ok(mcpTransaction < stateMcpCommit);
+  assert.match(browserHostSource, /bindManualTurnContents\(tab\)/);
+  const manualBinding = browserHostSource.slice(
+    browserHostSource.indexOf("bindManualTurnContents(tab)"),
+    browserHostSource.indexOf("bindWebContents()"),
+  );
+  assert.doesNotMatch(manualBinding, /executeJavaScript|insertCSS|querySelector|runBrowserHelperOperation|enableDeviceEmulation/);
+  assert.match(browserHostSource, /requireAutomaticBrowserInspection\(this, "ChatGPT authentication probe"\)/);
+  assert.match(browserHostSource, /requireAutomaticBrowserInspection\(this, "ChatGPT session and capability inspection"\)/);
+  assert.match(browserHostSource, /browserInteractionModeFor\(this\) === "manual"\) return;[\s\S]*?applyViewportCss\(\)/);
+  assert.match(
+    browserHostSource,
+    /page-title-updated[\s\S]*?browserInteractionModeFor\(this\) === "manual"\) return;/,
+  );
+  assert.doesNotMatch(modeSwitchHandler, /const pending = stateStore\.update|catch \(error\)/);
+  assert.match(electronMain, /browserInteractionMode === "manual"[\s\S]*?Local Zero Risk runtime is healthy/);
+  assert.match(appSource, /manualInteraction \? copy\.manualMcpStepThreeBody : copy\.mcpStepThreeBody/);
+  assert.match(appSource, /manualInteraction[\s\S]*?copy\.manualConnectorNotice/);
+  assert.match(appSource, /titleAction=\{manualInteraction \? \([\s\S]*?<ZeroRiskModelMenu/);
+  assert.match(appSource, /updateState\(await api!\.setZeroRiskPro\(enabled\)\)/);
+  assert.match(appSource, /zero-risk-model-info[\s\S]*?copy\.zeroRiskProProfileInfo/);
+  assert.match(appSource, /!proEnabled \? <span className="zero-risk-model-radio"><Icon name="check" \/><\/span> : null/);
+  assert.match(appSource, /proEnabled \? <span className="zero-risk-model-radio"><Icon name="check" \/><\/span> : null/);
+  assert.match(appSource, /mcp-create-tunnel\.mp4[\s\S]*?mcp-connect-connector\.mp4/);
+  assert.match(appSource, /function TutorialVideo[\s\S]*?autoPlay loop muted playsInline[\s\S]*?className="guide-media-expand"[\s\S]*?<Icon name="expand"/);
+  assert.match(appSource, /createPortal\([\s\S]*?className="guide-media is-expanded"[\s\S]*?document\.body/);
+  assert.match(stylesSource, /\.guide-media\.is-expanded\s*\{[^}]*position:\s*fixed;[^}]*inset:\s*0;/s);
+  assert.match(preloadSource, /setZeroRiskPro:[\s\S]*?launcher:zero-risk-pro/);
+  assert.match(electronMain, /runtimeHost\.setZeroRiskPro\(enabled === true\)/);
 });
 
 test("MCP surfaces use the official local protocol mark", () => {
@@ -103,9 +245,9 @@ test("the configured launcher exposes no persistent bridge opt-out", () => {
 test("MCP connection remains unavailable until the model catalog is verified", () => {
   assert.match(
     appSource,
-    /snapshot\.state\.codexCatalogVerified \? copy\.mcpStepTwoHint : copy\.mcpCatalogRequired/,
+    /manualInteraction \|\| configuringInactiveMode \|\| snapshot\.state\.codexCatalogVerified[\s\S]*?copy\.mcpStepTwoHint[\s\S]*?copy\.mcpCatalogRequired/,
   );
-  assert.match(appSource, /\|\| !snapshot\.state\.codexCatalogVerified/);
+  assert.match(appSource, /!manualInteraction && !configuringInactiveMode && !snapshot\.state\.codexCatalogVerified/);
 });
 
 test("MCP navigation remains locked while an operation is active", () => {

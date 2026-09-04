@@ -6,11 +6,15 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="TROUBLESHOOTING.md">Troubleshooting</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/WilliamK6/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/WilliamK6/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
   <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
@@ -74,13 +78,13 @@ preserving the ChatGPT profile and launcher configuration.
 **macOS or Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.ps1 | iex
 ```
 
 Then complete the three checks in the app:
@@ -95,13 +99,18 @@ The launcher detects the current account's ChatGPT controls during setup: Free/G
 only Luna, while Pro appears only when the signed-in account exposes it. The separate **MCP** page
 is optional and guides the full-harness setup without terminal commands.
 
+Model installation stores a random Responses capability inside the managed `openai_base_url`.
+Treat that complete URL as a local secret: do not paste it into chats, issues, or logs. Installation
+and upgrades commit the launcher config, Codex route, and recovery journals transactionally; after
+a successful change, restart Codex once so it loads the new route.
+
 The packaged launcher keeps sign-in and ChatGPT model turns in its embedded browser. It needs no
 model API key, installed Chrome/Chromium, system Node/Bun, or project-managed browser download.
 
 **Run from source**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/WilliamK6/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```
@@ -113,12 +122,18 @@ This source path requires Bun 1.4.0. The command installs locked dependencies an
 | Mode | Models | Local Codex tools | Extra setup |
 | --- | --- | --- | --- |
 | **Browser-only** | Free/Go: Luna; Plus: Instant–High; Pro: adds Extra High and Pro | No; Codex shows a warning | None |
-| **Full harness** | Free/Go: Luna; Plus: Instant–High; Pro: adds Extra High and Pro | Yes for every listed effort, including Pro | OpenAI tunnel + ChatGPT connector |
+| **Full harness (With Automation)** | Free/Go: Luna; Plus: Instant–High; Pro: adds Extra High and Pro | Yes for every listed effort, including Pro | OpenAI tunnel + ChatGPT connector |
+| **Zero Risk** | Choose the ChatGPT model and effort manually; optional Pro-sized context | Yes; the full turn-bound Codex harness remains available | Separate OpenAI tunnel + `Codex Zero Risk` connector; paste and send manually |
 
-Every picker entry has one fixed ChatGPT mode. Codex still displays its built-in Effort and Speed
-rows, but changing them cannot silently change the selected browser model. In Full mode every
-available effort receives the same turn-bound MCP capability. Pro has no separate restriction or
-reduced tool contract.
+Each automatic picker entry has one fixed ChatGPT mode. Codex still displays its built-in Effort and
+Speed rows, but changing them cannot silently change the selected browser model. In automatic Full
+mode every available effort receives the same turn-bound MCP capability. Pro has no separate
+restriction or reduced tool contract.
+
+Zero Risk keeps the local Responses bridge and full Codex harness, but never reads or changes the
+ChatGPT page and never sends a prompt for you. The launcher prepares and copies the prompt; you
+choose the model, effort, and `Codex Zero Risk` connector, then paste and send it yourself. This
+removes the account risk specifically associated with ChatGPT web automation.
 
 ## Full harness
 
@@ -126,26 +141,21 @@ Full mode connects ChatGPT's tool calls back to the current Codex task through t
 [OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound: it does
 not expose a public IP, open an inbound port, or require router forwarding.
 
+The launcher's **MCP** page guides the complete setup. For the exact clicks, see the
+[video walkthroughs](TROUBLESHOOTING.md).
+
 > [!WARNING]
 > Create a **new** connector named **Codex Native2** and set its permissions to
 > **Allow all actions**. Do not rename, refresh, or reuse an older **Codex Native** connector:
 > ChatGPT caches the public MCP contract by connector identity, and **Allow low-risk actions**
 > blocks commands and patches before they reach the Codex harness.
 
-1. Finish the required launcher setup.
-2. Open **MCP** in the launcher. Create the Tunnel and a regular API key on the same OpenAI account
-   that will use the ChatGPT connector; creating the key is free and does not consume model API
-   credits.
-3. Paste the Tunnel ID and API key, then press **Connect harness**.
-4. Enable **Developer Mode** in ChatGPT settings. Create a **new** connector using **Tunnel**, select
-   that exact Tunnel, set **Authentication** to **None**, and name it exactly **Codex Native2**.
-5. If an older **Codex Native** connector exists, leave it untouched. Do not rename or refresh it:
-   ChatGPT caches the public MCP contract by connector identity, and this release uses a new direct
-   turn-token contract. Under **Permissions** on **Codex Native2**, choose **Allow all actions**;
-   **Allow low-risk actions** blocks commands and patches before they reach this runtime. The outer
-   Codex harness still enforces its sandbox and approvals.
-6. Run **Verify runtime**. It selects **Codex Native2** exactly. If only **Codex Native** is found,
-   verification fails with an explicit migration error instead of accepting the legacy connector.
+1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
+   **Connect harness**.
+2. Enable ChatGPT **Developer Mode** and create a new Tunnel connector named exactly
+   **Codex Native2**, with **Authentication: None** and **Allow all actions**.
+3. Run **Verify runtime**. If only the legacy **Codex Native** connector exists, leave it untouched
+   and create **Codex Native2** instead of renaming or refreshing it.
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See
@@ -173,8 +183,11 @@ codex-chatgpt-web subagents native
 
 - This is unofficial browser automation, not an OpenAI API. ChatGPT UI changes can break selectors;
   drift fails explicitly instead of silently switching model or transport.
-- Browser state is a sensitive login artifact, and the loopback listener is reachable by processes
-  running as the same local user. Never share the launcher profile; use a trusted workstation.
+- Browser state and the capability-bearing local route are sensitive credentials. Functional
+  Responses routes require that capability, lifecycle control uses a different bearer, and browser
+  automation uses an authenticated private Electron debug broker instead of a raw DevTools port.
+  Arbitrary code running as the same OS user may still read these owner-only files, so never share
+  the launcher profile or managed `openai_base_url`; use a trusted workstation.
 - Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. Runtime,
   tests, and packaging are gated on all three in CI; account-bound browser and MCP flows use the
   separate [release validation](docs/release-validation.md).
@@ -200,8 +213,10 @@ bun run app:package
 `dev:launcher` starts a second launcher profile under `~/.codex-chatgpt-web-dev`: separate Electron
 state, browser cookies/login, ChatGPT account, configuration, sandboxed `CODEX_HOME`, chats,
 diagnostics, broker, and tunnel profile. It can run beside the normal launcher and never starts a
-Responses daemon or changes Codex. Optional Full setup starts and supervises only its isolated MCP
-tunnel, using the distinct ChatGPT connector name `Codex Native2 DEV`.
+Responses or health listener, installs an `openai_base_url`, or changes Codex. Its browser helpers
+still use the DEV launcher's authenticated private debug broker. Optional Full setup starts and
+supervises only its isolated MCP tunnel, using the distinct ChatGPT connector name
+`Codex Native2 DEV`.
 
 `dev:chat` is a named, persistent synthetic outer-Codex harness. It executes the current working
 tree through that isolated launcher browser, Temporary Chat, prompt compiler, Responses parser, and
@@ -218,6 +233,7 @@ reused implicitly. See
 - [Architecture](docs/architecture.md)
 - [DEV chat harness](docs/dev-chat.md)
 - [Security model](docs/security-model.md)
+- [Troubleshooting](TROUBLESHOOTING.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Star History
@@ -235,3 +251,5 @@ reused implicitly. See
 This is independent software and is not affiliated with or endorsed by OpenAI. Use it only with
 your own account and in accordance with applicable [Terms of Use](https://openai.com/policies/terms-of-use/)
 and workspace policies; it does not bypass authentication or access controls.
+
+Having trouble? See [Troubleshooting](TROUBLESHOOTING.md) for common problems and their solutions.

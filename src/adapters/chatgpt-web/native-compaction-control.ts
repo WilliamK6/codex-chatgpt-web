@@ -25,23 +25,38 @@ function compactionControlBinding(transaction: CompactionTransactionHandle): str
 }
 
 /**
- * Interrupt ordinary work at the MCP result boundary that caused Codex to request compaction.
- * The browser agent finishes its current response as the checkpoint, so an active turn does not
- * need a second visible ChatGPT message merely to ask the same agent for a summary.
+ * Stop an active browser response only if it asks for another tool after Codex requested
+ * compaction. Results for calls already handed to Codex remain byte-for-byte canonical: when they
+ * are enough to finish the task, that ordinary final answer remains publishable. A later tool call
+ * is intercepted before execution and receives this instruction; the retained conversation then
+ * receives the sole structured checkpoint request on a clean message boundary.
  */
-export function activeCompactionToolResultInstruction(
-  toolExecuted = true,
-): string {
+export function activeCompactionToolResultInstruction(): string {
+  return [
+    `<${CODEX_ACTIVE_COMPACTION_REQUEST_MARKER}>`,
+    "Codex reached its context limit before this newly requested tool could be sent for execution. The tool was not executed.",
+    "Stop ordinary task work now, call no more tools, and end this Web response normally.",
+    "Do not create or submit a checkpoint in this response. After it settles, the retained conversation will receive exactly one separate structured compaction handoff request.",
+    `</${CODEX_ACTIVE_COMPACTION_REQUEST_MARKER}>`,
+  ].join("\n");
+}
+
+/**
+ * Zero Risk cannot submit a second browser message automatically. When Codex compacts at an
+ * already-visible native tool boundary, the same manually submitted response returns the
+ * checkpoint through the same Zero Risk request instead.
+ */
+export function zeroRiskActiveCompactionToolResultInstruction(toolExecuted: boolean): string {
   return [
     `<${CODEX_ACTIVE_COMPACTION_REQUEST_MARKER}>`,
     toolExecuted
       ? "Codex reached its context limit while this Web response was waiting for the tool result above."
       : "Codex reached its context limit before the requested tool could be sent for execution. The tool was not executed.",
     toolExecuted
-      ? "Consume that canonical result, stop ordinary task work now, and do not call any more tools."
-      : "Stop ordinary task work now and do not call any more tools.",
+      ? "Consume that canonical result, stop ordinary task work now, and do not call any more work tools."
+      : "Stop ordinary task work now and do not call any more work tools.",
     COMPACT_PROMPT,
-    "Call no more tools. Finish this same Web response with only the complete checkpoint summary in ordinary text; that final response is the compaction result.",
+    "Call no more work tools. Return only the complete checkpoint summary to Codex with codex_turn_complete.",
     `</${CODEX_ACTIVE_COMPACTION_REQUEST_MARKER}>`,
   ].join("\n");
 }
@@ -53,7 +68,7 @@ export function structuredCompactionHandoffInstruction(
     "Automatic Codex context compaction has started. Stop ordinary task work and do not call any more work tools.",
     COMPACT_PROMPT,
     ...compactionControlBinding(transaction),
-    "After the control call returns submitted=true, call no more tools and end this Web response normally.",
-    "The outer bridge will accept compaction only after both the structured checkpoint is valid and this Web response has fully ended.",
+    "After the control call returns submitted=true, call no more tools. The bridge will close this one-purpose Web response after accepting the checkpoint.",
+    "The outer bridge accepts compaction only after the structured checkpoint is valid and its owned browser turn has physically settled.",
   ].join("\n");
 }

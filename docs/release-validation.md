@@ -9,7 +9,35 @@ flows are exercised manually on the platforms below.
 
 Record the release version, operating-system version, install path (`clean` or `upgrade`), ChatGPT
 plan, Codex version, result of each check, and a redacted Activity log for every failure. Never
-capture cookies, tunnel IDs, API keys, bearer tokens, or prompt contents.
+capture cookies, tunnel IDs, API keys, bearer tokens, Responses path capabilities, complete managed
+`openai_base_url` values, browser-debug capabilities, or prompt contents.
+
+## Local security-boundary gate
+
+Run these checks on every supported desktop platform without recording any secret value:
+
+1. Prove that the launcher does not start Chromium/Electron with a raw remote-debugging port and
+   that no DevTools discovery endpoint is reachable. An unauthenticated private-debug connection
+   must be rejected before target discovery; an authenticated helper must see only its exact leased
+   launcher surface and retain the normal browser smoke-test behavior.
+2. Prove that `/healthz` remains public on `127.0.0.1`, every unprefixed or incorrectly prefixed
+   functional `/v1` route fails before request-body, turn, or upstream work, and a correctly
+   capability-prefixed route completes. `/admin/*` must still require its independent control
+   bearer. Confirm that native upstream `Authorization` is forwarded unchanged.
+3. Upgrade a pre-capability configuration. Confirm that setup creates distinct Responses and
+   lifecycle-control secrets, installs the capability-bearing route transactionally, and tells the
+   user to restart Codex. Inject one write failure and prove that application config, Codex config,
+   route journals, and recovery state all return to their captured pre-migration contents.
+4. Restart Codex after the successful migration and prove that native models plus routed models
+   still work. Confirm that Activity, doctor, setup output, and rollback metadata do not disclose the
+   route or debug capability.
+5. Start the repository DEV launcher and `dev:chat`. Confirm that DEV invokes the in-process
+   handlers without binding a Responses/health listener or installing `openai_base_url`, while its
+   browser smoke test still succeeds through its isolated authenticated debug broker.
+
+These capabilities do not claim to resist arbitrary same-UID code that can read the owner-only
+configuration or browser profile. Validate file permissions separately and perform these checks on
+a trusted workstation.
 
 ## Windows 11 gate
 
@@ -24,13 +52,21 @@ Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account
    tool turn. Repeat with Pro when the account exposes Pro.
 6. Drive a chat past the compaction threshold and prove that it continues after compaction without
    a duplicate or orphaned browser turn.
-7. Cancel a running turn by closing its launcher tab, then cancel another with the launcher action;
+7. On a clean install, prove that setup offers both interaction modes and defaults to With
+   Automation. Select Zero Risk and prove that Codex shows exactly one generic Web model after
+   restart, a retained chat receives only the next prompt, and
+   compaction completes through MCP before the compacted continuation opens a fresh manual chat.
+   Inspect the copied prompt and prove that it contains only the current `request_id`, never a
+   surface nonce, capability token, or prompt-level lifecycle commands.
+   Switch back to Automatic and prove that the account-visible catalog is restored.
+8. Cancel a running turn by closing its launcher tab, then cancel another with the launcher action;
    prove that neither turn recreates a tab or keeps the runtime busy.
-8. Quit the launcher during an active turn, confirm the explicit cancellation path, reopen it, and
+9. Quit the launcher during an active turn, confirm the explicit cancellation path, reopen it, and
    prove that the saved ChatGPT session and Codex route are still valid.
-9. Disconnect the bridge and prove that the exact previous Codex route is restored. Reconnect it
-   and prove that the existing private MCP credentials are reused rather than replaced.
-10. Upgrade from the previous public release and prove that launcher state, browser state, Codex
+10. Prove Codex Voice can create a WebRTC call while Responses use the local bridge. Disconnect the
+   bridge and prove that both exact previous route assignments are restored; reconnect it and prove
+   that the existing private MCP credentials are reused rather than replaced.
+11. Upgrade from the previous public release and prove that launcher state, browser state, Codex
     settings, and MCP configuration survive the updater transaction.
 
 Any failed or unexecuted item blocks a stable release. An alpha may ship with a named failed item

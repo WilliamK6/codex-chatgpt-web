@@ -52,7 +52,10 @@ jobs:
         if: runner.os == 'Linux'
         run: bun run launcher/scripts/prepare-linux-appimage-tools.cjs
       - run: bun run verify
-      - run: bun run app:package
+      - name: Package launcher
+        run: bun run app:package
+        env:
+          CSC_FOR_PULL_REQUEST: ${{ runner.os == 'macOS' }}
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux'
         run: |

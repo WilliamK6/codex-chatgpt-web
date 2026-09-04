@@ -5,17 +5,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   LAUNCHER_BROWSER_HOST_KIND,
+  LAUNCHER_BROWSER_IDLE_URL,
+  LauncherManualTurnTimedOutError,
   LauncherRetainedConversationUnavailableError,
   LauncherBrowserTurnCancelledError,
+  endLauncherManualTurn,
   inspectLauncherBrowserHost,
+  inspectLauncherBrowserHostLiveness,
   notifyLauncherTurn,
+  markLauncherManualTurnStarted,
   readLauncherBrowserHostDescriptor,
   releaseLauncherRetainedConversation,
   selectLauncherPage,
+  startLauncherManualTurn,
+  waitForLauncherManualSent,
+  waitForLauncherManualTerminal,
 } from "../src/launcher-browser-host";
 import type { Browser, BrowserContext, Page } from "playwright-core";
 
 const roots: string[] = [];
+const DEBUG_LEASE_TOKEN = "debug-lease-token-0123456789abcdefghijklmnopqr";
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -24,16 +33,20 @@ afterEach(() => {
 function descriptorFile(
   controlEndpoint = "http://127.0.0.1:39111",
   profile: "production" | "development" = "production",
+  debugEndpoint = "tcp://127.0.0.1:39110",
 ): string {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-descriptor-"));
   roots.push(root);
   const path = join(root, "launcher-browser.json");
   writeFileSync(path, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39110",
+    debug: {
+      endpoint: debugEndpoint,
+      token: "launcher-debug-token-0123456789abcdefghijklmnopqr",
+    },
     control: {
       endpoint: controlEndpoint,
       token: "launcher-control-token-0123456789abcdefghijklmnop",
@@ -45,7 +58,7 @@ function descriptorFile(
     partition: profile === "development"
       ? "persist:codex-web-gpt-dev-chatgpt"
       : "persist:codex-web-gpt-chatgpt",
-    idleUrl: "about:blank#codex-web-gpt-browser-host",
+    idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "launcher_surface_id_0123456789AB",
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
@@ -58,7 +71,7 @@ test("launcher descriptor is owner-only, loopback-only, and process-bound", () =
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: "production",
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39110",
+    debug: { endpoint: "tcp://127.0.0.1:39110" },
     surfaceId: "launcher_surface_id_0123456789AB",
   });
   if (process.platform !== "win32") {
@@ -78,7 +91,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
     };
     response.writeHead(200, { "content-type": "application/json" });
     response.end(request.url === "/v1/turn/start"
-      ? '{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","reused":true,"connectorBound":true}\n'
+      ? `{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","debugLeaseToken":"${DEBUG_LEASE_TOKEN}","reused":true,"connectorBound":true}\n`
       : request.url === "/v1/turn/end"
         ? '{"ok":true,"cancelledByUser":false}\n'
         : '{"ok":true}\n');
@@ -100,6 +113,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       requireRetainedConversation: true,
     })).resolves.toEqual({
       surfaceId: "launcher_surface_id_0123456789AB",
+      debugLeaseToken: DEBUG_LEASE_TOKEN,
       reused: true,
       connectorBound: true,
     });
@@ -116,8 +130,14 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       phase: "heartbeat",
       traceId: "abc123def456",
       helperPid: process.pid,
+      refreshViewport: true,
     });
-    expect(received.body).toEqual({ phase: "heartbeat", traceId: "abc123def456", helperPid: process.pid });
+    expect(received.body).toEqual({
+      phase: "heartbeat",
+      traceId: "abc123def456",
+      helperPid: process.pid,
+      refreshViewport: true,
+    });
     await expect(notifyLauncherTurn(path, {
       phase: "end",
       traceId: "abc123def456",
@@ -261,6 +281,20 @@ test("launcher session verification uses the authenticated control channel inste
   }
 });
 
+test("launcher liveness verification checks only owned process and private debug metadata", async () => {
+  const path = descriptorFile(
+    "http://127.0.0.1:39111",
+    "development",
+    "tcp://127.0.0.1:39120",
+  );
+  await expect(inspectLauncherBrowserHostLiveness(path, {
+    expectedProfile: "development",
+  })).resolves.toMatchObject({
+    profile: "development",
+    debug: { endpoint: "tcp://127.0.0.1:39120" },
+  });
+});
+
 test("launcher session verification reports its own deadline instead of a generic abort", async () => {
   const server = createServer(async (request, response) => {
     for await (const _chunk of request) { /* consume request */ }
@@ -288,9 +322,9 @@ test("launcher session verification reports its own deadline instead of a generi
 test("launcher descriptor rejects non-loopback browser ownership", () => {
   const path = descriptorFile();
   const value = JSON.parse(readFileSync(path, "utf8"));
-  value.endpoint = "https://example.com:443";
+  value.debug.endpoint = "tcp://example.com:443";
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("http://127.0.0.1");
+  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("tcp://127.0.0.1");
 });
 
 test("launcher profile checks reject cross-profile browser ownership", async () => {
@@ -310,7 +344,7 @@ test("launcher page selection uses the owned surface marker instead of URL order
     evaluate: async () => "another_surface_id_0123456789ABC",
   } as unknown as Page;
   const ownedPage = {
-    url: () => "about:blank#codex-web-gpt-browser-host",
+    url: () => LAUNCHER_BROWSER_IDLE_URL,
     evaluate: async () => descriptor.surfaceId,
   } as unknown as Page;
   const context = {
@@ -358,4 +392,108 @@ test("launcher page selection stops immediately when acquisition is aborted", as
     descriptor.surfaceId,
     controller.signal,
   )).rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("manual launcher control separates idempotent start from reconnectable Sent observation", async () => {
+  const requests: Array<{ url: string | undefined; body: unknown }> = [];
+  let sentPolls = 0;
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    requests.push({ url: request.url, body });
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/v1/manual/start") {
+      response.end(JSON.stringify({
+        ok: true,
+        tabId: "manual-tab",
+        reused: false,
+        deadlineAt: "2026-08-30T00:01:00.000Z",
+        state: "awaiting-user",
+      }));
+      return;
+    }
+    if (request.url === "/v1/manual/wait-sent" && sentPolls++ === 0) {
+      response.statusCode = 202;
+      response.end('{"ok":true,"status":"pending"}');
+      return;
+    }
+    if (request.url === "/v1/manual/wait-sent") {
+      response.end('{"ok":true,"status":"sent","sentAt":"2026-08-30T00:00:30.000Z"}');
+      return;
+    }
+    if (request.url === "/v1/manual/started") {
+      response.end('{"ok":true}');
+      return;
+    }
+    if (request.url === "/v1/manual/wait-terminal") {
+      response.end('{"ok":true,"status":"cancelled"}');
+      return;
+    }
+    response.end('{"ok":true,"cancelledByUser":false}');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    const owner = { traceId: "manual123456", helperPid: process.pid };
+    await expect(startLauncherManualTurn(path, { ...owner, prompt: "private prompt" })).resolves.toMatchObject({
+      tabId: "manual-tab",
+      reused: false,
+      state: "awaiting-user",
+    });
+    await expect(waitForLauncherManualSent(path, owner)).resolves.toEqual({
+      sentAt: "2026-08-30T00:00:30.000Z",
+    });
+    await expect(markLauncherManualTurnStarted(path, owner)).resolves.toBeUndefined();
+    await expect(waitForLauncherManualTerminal(path, owner)).resolves.toEqual({ status: "cancelled" });
+    await expect(endLauncherManualTurn(path, { ...owner, status: "completed", retain: true }))
+      .resolves.toEqual({ cancelledByUser: false });
+    expect(requests.map(request => request.url)).toEqual([
+      "/v1/manual/start",
+      "/v1/manual/wait-sent",
+      "/v1/manual/wait-sent",
+      "/v1/manual/started",
+      "/v1/manual/wait-terminal",
+      "/v1/manual/end",
+    ]);
+    expect(requests[0]?.body).toEqual({ ...owner, prompt: "private prompt" });
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  }
+});
+
+test("manual Sent wait preserves typed timeout and cancellation signals", async () => {
+  for (const reply of [
+    { status: 408, body: { error: "too slow", code: "manual_turn_timed_out" } },
+    { status: 409, body: { error: "closed", code: "turn_cancelled" } },
+  ]) {
+    const server = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* drain */ }
+      response.writeHead(reply.status, { "content-type": "application/json" });
+      response.end(JSON.stringify(reply.body));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("test server has no port");
+      const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+      const error = await waitForLauncherManualSent(path, {
+        traceId: "manual123456",
+        helperPid: process.pid,
+      }).catch(caught => caught);
+      expect(error).toBeInstanceOf(reply.status === 408
+        ? LauncherManualTurnTimedOutError
+        : LauncherBrowserTurnCancelledError);
+    } finally {
+      await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+    }
+  }
 });

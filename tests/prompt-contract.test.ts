@@ -55,24 +55,28 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(transportOnly).toContain("After a deterministic tool failure, update the working hypothesis from that result");
   expect(transportOnly).toContain("do not repeat the same call unless its inputs or observable state changed.");
   expect(transportOnly).toContain("Continue using the available tools until the requested work is complete and verified.");
+  expect(transportOnly).toContain("Write the user-facing final answer only after the last required tool result has settled.");
   expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
   expect(transportOnly).not.toMatch(/codex_bind_turn|binding_id|outer_tool_gateway|command_tool/);
-  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex_tool_call/);
+  expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex\.control\.turn_complete/);
   expect(transportOnly).not.toMatch(/expired|invalid|revoked|blocked|safety|security layer|permission gate/i);
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
   expect(compiled.text).not.toContain("internally compacts this response");
 });
 
-test("Pro executes directly without delegating while other Web modes keep their existing contract", () => {
+test("Pro preserves the same native Codex delegation contract as Extra High", () => {
   const token = "turn_12345678901234567890123456789012";
   const capabilities = { localToolsEnabled: true, solAvailable: true, proAvailable: true };
   const pro = compileChatGptWebPrompt(request("max"), capabilities, token);
   const extraHigh = compileChatGptWebPrompt(request("xhigh"), capabilities, token);
 
-  expect(pro.text).toContain("Complete this task directly in the current parent response.");
-  expect(pro.text).toContain("Do not create, spawn, delegate to, or wait on sub-agents");
-  expect(pro.text).toContain("Use non-agent tools directly instead.");
-  expect(extraHigh.text).not.toContain("Do not create, spawn, delegate to, or wait on sub-agents");
+  for (const compiled of [pro, extraHigh]) {
+    expect(compiled.text).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
+    expect(compiled.text).toContain(`Pass turn_token ${token} unchanged to every Codex Native call in this response`);
+    expect(compiled.text).not.toContain("Complete this task directly in the current parent response.");
+    expect(compiled.text).not.toContain("Do not create, spawn, delegate to, or wait on sub-agents");
+    expect(compiled.text).not.toContain("Use non-agent tools directly instead.");
+  }
 });
 
 test("read-only prompts resume without exposing a bind capability", () => {
@@ -181,8 +185,10 @@ test("Bigger Context uses the minimum transport and reserves three stages for co
 test("browser-only Medium directs users to the full harness", () => {
   const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
   const warning = chatGptReadOnlyContextWarning(request("medium"), capabilities);
-  expect(warning).toContain("Browser-only mode");
-  expect(warning).toContain("Full harness");
+  expect(warning).toStartWith("> **Local tools unavailable**");
+  expect(warning).toContain("`MCP`");
+  expect(warning).toContain("`Codex Web GPT`");
+  expect(warning).toContain("`Full`");
   expect(warning).toContain("selected ChatGPT Web model");
   expect(warning).not.toContain("tool-capable ChatGPT Web model first");
   expect(chatGptReadOnlyContextWarning(request("medium"), {

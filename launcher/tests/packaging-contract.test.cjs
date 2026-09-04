@@ -9,6 +9,7 @@ const launcherRoot = path.resolve(__dirname, "..");
 const repositoryRoot = path.resolve(launcherRoot, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(launcherRoot, "package.json"), "utf8"));
 const repositoryManifest = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8"));
+const distributionRepository = "WilliamK6/codex-chatgpt-web";
 
 test("the public launcher command uses the Electron bootstrap", () => {
   assert.equal(repositoryManifest.scripts.launcher, "bun run scripts/start-launcher.ts");
@@ -25,7 +26,15 @@ test("the full verification gate audits launcher dependencies", () => {
 test("launcher publishes native packages for all supported desktop operating systems", () => {
   assert.equal(manifest.build.appId, "dev.codexwebgpt.launcher");
   assert.equal(manifest.build.artifactName, "codex-web-gpt-${version}-${os}-${arch}.${ext}");
+  assert.equal(
+    manifest.build.mac.extendInfo.NSHumanReadableCopyright,
+    "Copyright © 2026 miuuyy — Codex Macbook Pro",
+  );
   assert.deepEqual(manifest.build.mac.target, ["dmg", "zip"]);
+  assert.deepEqual(
+    manifest.build.mac.signIgnore,
+    ["[/\\\\]Contents[/\\\\]Resources[/\\\\]runtime[/\\\\]runtime[/\\\\]bun$"],
+  );
   assert.deepEqual(manifest.build.win.target, ["nsis"]);
   assert.equal(manifest.build.win.icon, "assets/icon.ico");
   assert.deepEqual(manifest.build.linux.target, ["AppImage"]);
@@ -51,6 +60,8 @@ test("release installers resolve checksummed native launcher assets", () => {
     assert.match(installer, /SHA-?256/i);
     assert.match(installer, /releases\/download/);
   }
+  assert.ok(shellInstaller.includes(`CODEX_WEB_GPT_REPOSITORY:-${distributionRepository}`));
+  assert.ok(windowsInstaller.includes(`else { "${distributionRepository}" }`));
   assert.match(shellInstaller, /PLATFORM="mac"/);
   assert.match(shellInstaller, /PLATFORM="linux"/);
   assert.match(shellInstaller, /codex-web-gpt\.desktop/);
@@ -61,6 +72,9 @@ test("release installers resolve checksummed native launcher assets", () => {
   assert.match(packager, /electron-builder\/out\/cli\/cli\.js/);
   assert.match(packager, /target === "--mac" && !env\.CSC_LINK && !env\.CSC_NAME/);
   assert.match(packager, /--config\.mac\.identity=-/);
+  assert.match(packager, /verifySignedMacArchive\(\)/);
+  assert.match(packager, /codesign[\s\S]*--verify[\s\S]*--deep[\s\S]*--strict/);
+  assert.match(packager, /validateRuntimeBundle/);
   assert.doesNotMatch(packager, /electron-builder\.cmd/);
   assert.match(shellInstaller, /shell_quote\(\)/);
   assert.match(shellInstaller, /RUNNER_SOURCE/);
@@ -93,6 +107,26 @@ test("release installers resolve checksummed native launcher assets", () => {
   const packageSmoke = fs.readFileSync(path.join(launcherRoot, "scripts", "smoke-package.cjs"), "utf8");
   assert.match(packageSmoke, /run\(installer, \["\/S", "\/currentuser"\]/);
   assert.match(packageSmoke, /reg\.exe[\s\S]*InstallLocation/);
+});
+
+test("launcher-owned links and downloads target the hardened fork", () => {
+  const updater = fs.readFileSync(path.join(launcherRoot, "electron", "update.cjs"), "utf8");
+  const main = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
+  const terminalInstaller = fs.readFileSync(path.join(repositoryRoot, "scripts", "install.sh"), "utf8");
+  const readme = fs.readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
+  const readmeZh = fs.readFileSync(path.join(repositoryRoot, "README.zh-CN.md"), "utf8");
+
+  assert.match(updater, new RegExp(`const REPOSITORY = "${distributionRepository}"`));
+  assert.ok(main.includes(`const GITHUB_URL = "https://github.com/${distributionRepository}"`));
+  assert.ok(terminalInstaller.includes(`CODEX_CHATGPT_WEB_REPOSITORY:-${distributionRepository}`));
+  assert.equal(repositoryManifest.repository.url, `git+https://github.com/${distributionRepository}.git`);
+  assert.equal(repositoryManifest.homepage, `https://github.com/${distributionRepository}#readme`);
+  assert.equal(repositoryManifest.bugs.url, `https://github.com/${distributionRepository}/issues`);
+  for (const documentation of [readme, readmeZh]) {
+    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/download/v${repositoryManifest.version}/install-launcher.sh`));
+    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/download/v${repositoryManifest.version}/install-launcher.ps1`));
+    assert.ok(documentation.includes(`git clone https://github.com/${distributionRepository}.git`));
+  }
 });
 
 test("packaged launcher owns a detached checksummed updater for every release platform", () => {
@@ -136,6 +170,11 @@ test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
 test("Linux AppImage fallback uses one owned extraction and removes it on exit", {
   skip: process.platform !== "linux" ? "AppImage process identity is Linux-specific" : false,
 }, () => {
+  // node:test honours the `skip` option above and reports this as skipped. Bun's shim ignores that
+  // option and runs the body anyway, and implements neither t.skip(), so the test read /proc on
+  // macOS and failed for everyone running `bun test` locally. Returning early is the one form both
+  // runners agree on.
+  if (process.platform !== "linux") return;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-appimage-runner-"));
   const runtime = path.join(root, "runtime");
   const appImage = path.join(root, "Codex Web GPT.AppImage");

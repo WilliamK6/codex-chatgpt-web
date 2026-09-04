@@ -1,21 +1,37 @@
 import { cpSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { defaultBrokerEndpoint } from "../src/config";
 import { VERSION } from "../src/version";
+
+const require = createRequire(import.meta.url);
+const { validateRuntimeBundle } = require("../launcher/electron/runtime-install.cjs") as {
+  validateRuntimeBundle: (
+    runtimeRoot: string,
+    identity: { version: string; platform: string; arch: string },
+  ) => string;
+};
 
 const sourceBundle = resolve(process.argv[2] ?? "dist/runtime");
 const sourceRoot = resolve(import.meta.dir, "..");
 const root = join(homedir(), `.codex-chatgpt-web-release-smoke-${process.pid}-${Date.now()}`);
 const firstLocation = join(root, "first-location");
 const runtimeRoot = join(root, "relocated-runtime");
-cpSync(sourceBundle, firstLocation, { recursive: true });
+cpSync(sourceBundle, firstLocation, { recursive: true, verbatimSymlinks: true });
 renameSync(firstLocation, runtimeRoot);
+validateRuntimeBundle(runtimeRoot, {
+  version: VERSION,
+  platform: process.platform,
+  arch: process.arch,
+});
 
 const manifest = JSON.parse(readFileSync(join(runtimeRoot, "manifest.json"), "utf8")) as Record<string, unknown>;
-if (manifest.schemaVersion !== 1
+if (manifest.schemaVersion !== 2
   || manifest.appVersion !== VERSION
   || manifest.playwright !== "1.62.0"
+  || !Array.isArray(manifest.files)
+  || manifest.files.length === 0
   || !/^[a-f0-9]{64}$/.test(String(manifest.bundleId ?? ""))) {
   throw new Error(`Unexpected runtime manifest: ${JSON.stringify(manifest)}`);
 }
@@ -47,7 +63,7 @@ const portServer = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data()
 const port = portServer.port;
 portServer.stop();
 const config = {
-  version: 3,
+  version: 4,
   releaseVersion: VERSION,
   mode: "browser-only",
   host: "127.0.0.1",
@@ -62,6 +78,7 @@ const config = {
   proAvailable: true,
   autoApproveToolCalls: false,
   controlToken: "release-smoke-control-token-0123456789abcdef",
+  responsesToken: "release-smoke-responses-token-0123456789abcdefghij",
   runtimeCommand,
   acknowledgedUnofficialAt: new Date().toISOString(),
 };
@@ -87,17 +104,22 @@ try {
     throw new Error(`unexpected health payload: ${JSON.stringify(payload)}`);
   }
 
-  const unauthenticatedModels = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  const responsesBase = `http://127.0.0.1:${port}/${config.responsesToken}/v1`;
+  const unprefixedModels = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  if (unprefixedModels.status !== 404) {
+    throw new Error(`unprefixed model route did not fail closed: HTTP ${unprefixedModels.status}`);
+  }
+  const unauthenticatedModels = await fetch(`${responsesBase}/models`);
   const unauthenticatedModelsBody = await unauthenticatedModels.json() as { error?: { message?: string } };
   if (unauthenticatedModels.status !== 502
     || !unauthenticatedModelsBody.error?.message?.includes("incoming Bearer authorization")) {
-    throw new Error(`native model passthrough did not fail closed without Codex auth: ${JSON.stringify(unauthenticatedModelsBody)}`);
+    throw new Error(`native model passthrough did not preserve Codex auth requirements: ${JSON.stringify(unauthenticatedModelsBody)}`);
   }
-  const websocketNegotiation = await fetch(`http://127.0.0.1:${port}/v1/responses`);
+  const websocketNegotiation = await fetch(`${responsesBase}/responses`);
   if (websocketNegotiation.status !== 426) {
     throw new Error(`Responses WebSocket negotiation did not select Codex HTTP/SSE fallback: HTTP ${websocketNegotiation.status}`);
   }
-  const invalid = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+  const invalid = await fetch(`${responsesBase}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "chatgpt-web/not-enabled", input: "test", stream: false }),
@@ -119,7 +141,7 @@ try {
     || drainPayload.active_http_turns !== 0 || drainPayload.active_browser_turns !== 0) {
     throw new Error(`daemon did not acknowledge an idle authenticated drain: ${JSON.stringify(drainPayload)}`);
   }
-  const rejectedWhileDraining = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
+  const rejectedWhileDraining = await fetch(`${responsesBase}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "chatgpt-web/high", reasoning: { effort: "high" }, input: "test", stream: false }),

@@ -17,15 +17,17 @@ const {
 } = require("electron");
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
+const { BrowserDebugServer } = require("./browser-debug-server.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
   createLogger,
   exportSanitizedLogs,
   installProcessDiagnosticGuards,
+  redactText,
   registerLoggedIpc,
 } = require("./logging.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
-const { ensurePackagedRuntime } = require("./runtime-install.cjs");
+const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
@@ -50,7 +52,7 @@ const BROWSER_DESCRIPTOR_PATH = path.join(CORE_HOME, "runtime", "launcher-browse
 const BROWSER_HELPER_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "runtime", "app", "browser-helper.cjs")
   : path.join(SOURCE_ROOT, ".launcher-runtime", "browser-helper.cjs");
-const GITHUB_URL = "https://github.com/miuuyy/codex-chatgpt-web";
+const GITHUB_URL = "https://github.com/WilliamK6/codex-chatgpt-web";
 const X_URL = "https://x.com/miu21590";
 const CONNECTORS_URL = "https://chatgpt.com/#settings/Plugins";
 const TUNNELS_URL = "https://platform.openai.com/settings/organization/tunnels";
@@ -75,16 +77,18 @@ installProcessDiagnosticGuards({
 });
 
 let mainWindow = null;
+let mainWindowReadyToShow = false;
+let mainWindowShowRequested = false;
 let browserHost = null;
 let runtimeHost = null;
 let browserControl = null;
+let browserDebug = null;
 let runtimeSupervisor = null;
 let tray = null;
 let quitting = false;
 let shutdownInProgress = false;
 let exitCommitted = false;
 let smokePassedThisSession = false;
-let cdpPort = 0;
 let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
@@ -188,15 +192,58 @@ function trayImage() {
   return image;
 }
 
-function createTray(logger) {
+const NATIVE_COPY = Object.freeze({
+  en: Object.freeze({
+    openLauncher: "Open Codex Web GPT",
+    quit: "Quit",
+    exportDiagnostics: "Export privacy-safe diagnostics",
+    cancel: "Cancel",
+    remove: "Remove",
+    removeTitle: "Remove Codex Web GPT",
+    removeMessage: "Remove the ChatGPT Web models from Codex and restore the previous model route?",
+    removeDetail: "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
+  }),
+  "zh-CN": Object.freeze({
+    openLauncher: "打开 Codex Web GPT",
+    quit: "退出",
+    exportDiagnostics: "导出隐私安全诊断",
+    cancel: "取消",
+    remove: "移除",
+    removeTitle: "移除 Codex Web GPT",
+    removeMessage: "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？",
+    removeDetail: "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。",
+  }),
+  ja: Object.freeze({
+    openLauncher: "Codex Web GPT を開く",
+    quit: "終了",
+    exportDiagnostics: "プライバシー保護済みの診断情報をエクスポート",
+    cancel: "キャンセル",
+    remove: "削除",
+    removeTitle: "Codex Web GPT を削除",
+    removeMessage: "Codex から ChatGPT Web モデルを削除し、以前のモデルルートを復元しますか？",
+    removeDetail: "ランチャーの ChatGPT ログインプロファイルは保持されます。Codex を一度再起動する必要があります。",
+  }),
+});
+
+function nativeCopyFor(language) {
+  return NATIVE_COPY[language] || NATIVE_COPY.en;
+}
+
+function updateTrayMenu(language) {
+  if (!tray) return;
+  const copy = nativeCopyFor(language);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: copy.openLauncher, click: () => showMainWindow() },
+    { type: "separator" },
+    { label: copy.quit, click: () => { void requestQuit(); } },
+  ]));
+}
+
+function createTray(logger, language) {
   try {
     tray = new Tray(trayImage());
     tray.setToolTip(LAUNCHER_PROFILE.displayName);
-    tray.setContextMenu(Menu.buildFromTemplate([
-      { label: `Open ${LAUNCHER_PROFILE.displayName}`, click: () => showMainWindow() },
-      { type: "separator" },
-      { label: "Quit", click: () => { void requestQuit(); } },
-    ]));
+    updateTrayMenu(language);
     tray.on("click", () => showMainWindow());
     return true;
   } catch (error) {
@@ -207,7 +254,13 @@ function createTray(logger) {
 }
 
 function showMainWindow() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // A Windows login launch may still be materializing the packaged runtime when the user opens
+  // the desktop shortcut. Electron delivers `second-instance` immediately, before `createWindow`
+  // has produced anything to show. Preserve that foreground request until the real window reaches
+  // `ready-to-show`; otherwise the already-running `--hidden` instance silently consumes it.
+  mainWindowShowRequested = true;
+  if (!mainWindowReadyToShow || !mainWindow || mainWindow.isDestroyed()) return;
+  mainWindowShowRequested = false;
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
@@ -310,7 +363,10 @@ function createWindow({ logger, stateStore, windowStatePath, startHidden }) {
     else void requestQuit();
   });
   window.on("closed", () => {
-    if (mainWindow === window) mainWindow = null;
+    if (mainWindow === window) {
+      mainWindow = null;
+      mainWindowReadyToShow = false;
+    }
   });
   for (const event of ["enter-full-screen", "leave-full-screen", "maximize", "unmaximize"]) {
     window.on(event, () => send("launcher:window-state-changed", windowStateSnapshot(window)));
@@ -319,14 +375,16 @@ function createWindow({ logger, stateStore, windowStatePath, startHidden }) {
     if (!state.onboardingComplete && !Number.isFinite(windowState.bounds.x)) window.center();
     if (windowState.maximized) window.maximize();
     if (windowState.fullscreen) window.setFullScreen(true);
-    if (!startHidden) window.show();
+    if (mainWindow === window) mainWindowReadyToShow = true;
+    if (mainWindowShowRequested) showMainWindow();
+    else if (!startHidden) window.show();
   });
   trackWindowState(window, windowStatePath, (error) => {
     logger.warn("launcher.window_state_write_failed", {
       message: error instanceof Error ? error.message : String(error),
     });
   });
-  logger.info("launcher.window_created", { platform: process.platform, cdpPort });
+  logger.info("launcher.window_created", { platform: process.platform });
   return window;
 }
 
@@ -339,7 +397,16 @@ async function loadRenderer(window) {
 }
 
 function validateLanguage(value) {
-  if (value !== "en" && value !== "zh-CN") throw new Error("Language must be en or zh-CN");
+  if (value !== "en" && value !== "zh-CN" && value !== "ja") {
+    throw new Error("Language must be en, zh-CN, or ja");
+  }
+  return value;
+}
+
+function validateBrowserInteractionMode(value) {
+  if (value !== "automatic" && value !== "manual") {
+    throw new Error("Browser interaction mode must be automatic or manual");
+  }
   return value;
 }
 
@@ -367,6 +434,10 @@ function registerIpc({ logger, stateStore }) {
     state: stateStore.read(),
     browser: browserHost?.snapshot() ?? null,
     connectorName: runtimeHost.browserConnectorName(),
+    connectorNames: {
+      automatic: runtimeHost.setupConnectorName(),
+      manual: "Codex Zero Risk",
+    },
     mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
     logs: logger.recent(),
     urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
@@ -378,7 +449,11 @@ function registerIpc({ logger, stateStore }) {
     update: updateController?.getState() ?? { status: "disabled" },
   }));
 
-  handle("launcher:set-language", (_event, language) => stateStore.update({ language: validateLanguage(language) }));
+  handle("launcher:set-language", (_event, language) => {
+    const state = stateStore.update({ language: validateLanguage(language) });
+    updateTrayMenu(state.language);
+    return state;
+  });
   handle("launcher:open-social", async (_event, target) => {
     const url = target === "github" ? GITHUB_URL : target === "x" ? X_URL : null;
     if (!url) throw new Error("Unknown social target");
@@ -386,12 +461,20 @@ function registerIpc({ logger, stateStore }) {
     const patch = target === "github" ? { githubOpened: true } : { xOpened: true };
     return stateStore.update(patch);
   });
-  handle("launcher:complete-onboarding", (_event, language) => {
+  handle("launcher:complete-onboarding", (_event, language, rawInteractionMode) => {
     const current = stateStore.read();
     if (!current.githubOpened || !current.xOpened) throw new Error("Open the GitHub and X pages before continuing");
     if (current.autoStart) setAutostart(app, true);
-    const next = stateStore.update({ language: validateLanguage(language), onboardingComplete: true });
-    logger.info("launcher.onboarding_completed", { language: next.language });
+    const next = stateStore.update({
+      language: validateLanguage(language),
+      browserInteractionMode: validateBrowserInteractionMode(rawInteractionMode),
+      onboardingComplete: true,
+    });
+    updateTrayMenu(next.language);
+    logger.info("launcher.onboarding_completed", {
+      language: next.language,
+      browserInteractionMode: next.browserInteractionMode,
+    });
     return next;
   });
 
@@ -406,12 +489,16 @@ function registerIpc({ logger, stateStore }) {
     return true;
   });
   handle("launcher:browser-surface-active", (_event, active) => browserHost.setSurfaceActive(active === true));
-  handle("launcher:browser-show", () => browserHost.reveal());
+  handle("launcher:browser-show", () => browserHost.reveal(
+    stateStore.read().browserInteractionMode === "automatic",
+  ));
   handle("launcher:browser-hide", () => { browserHost?.hide(); return browserHost?.snapshot(); });
   handle("launcher:browser-navigate", (_event, action) => browserHost.navigate(action));
   handle("launcher:browser-zoom", (_event, action) => browserHost.zoom(action));
   handle("launcher:browser-tab-select", (_event, tabId) => browserHost.selectTab(tabId));
   handle("launcher:browser-tab-close", (_event, tabId) => browserHost.closeTab(tabId));
+  handle("launcher:manual-prompt-copy", (_event, tabId) => browserHost.copyManualPrompt(tabId));
+  handle("launcher:manual-prompt-sent", (_event, tabId) => browserHost.confirmManualSent(tabId));
   handle("launcher:browser-login", async () => {
     const browser = await browserHost.openLogin();
     if (browser.authenticated) {
@@ -420,6 +507,15 @@ function registerIpc({ logger, stateStore }) {
     }
     return browser;
   });
+  handle("launcher:browser-passkey-login", async () => {
+    const browser = await browserHost.openPasskeyLogin();
+    if (browser.authenticated) {
+      const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+      send("launcher:state-changed", state);
+    }
+    return browser;
+  });
+  handle("launcher:browser-passkey-login-continue", () => runtimeHost.continuePasskeyLogin());
   handle("launcher:browser-logout", async () => {
     const browser = await browserHost.logout();
     const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
@@ -432,6 +528,9 @@ function registerIpc({ logger, stateStore }) {
     return state;
   });
   handle("launcher:browser-smoke", async () => {
+    if (stateStore.read().browserInteractionMode === "manual") {
+      throw new Error("Browser smoke testing is disabled in Zero Risk mode");
+    }
     const result = await browserHost.smokeTest();
     stateStore.update({ browserSmokePassed: true, browserSmokeVersion: app.getVersion() });
     smokePassedThisSession = true;
@@ -472,6 +571,23 @@ function registerIpc({ logger, stateStore }) {
       send("launcher:state-changed", state);
       publishOperation({ name: operationName, status: "failed", message });
       return report;
+    }
+    if (stateStore.read().browserInteractionMode === "manual") {
+      const state = stateStore.update({ mcpSetupComplete: true });
+      send("launcher:state-changed", state);
+      const successMessage = "Local Zero Risk runtime is healthy; connector selection remains a manual turn step";
+      publishOperation({ name: operationName, status: "completed", message: successMessage });
+      return {
+        ...report,
+        checks: [
+          ...report.checks.filter((check) => check.id !== "connector"),
+          {
+            id: "connector",
+            status: "warning",
+            message: `Select ChatGPT connector ${JSON.stringify(runtimeHost.mcpConnectorName())} manually for every Zero Risk turn`,
+          },
+        ],
+      };
     }
     try {
       publishOperation({ name: operationName, status: "running", message: "Checking ChatGPT connector" });
@@ -515,20 +631,15 @@ function registerIpc({ logger, stateStore }) {
   });
   handle("launcher:uninstall-integration", async () => {
     if (IS_DEV_PROFILE) throw new Error("DEV profile has no Codex integration to remove");
-    const language = stateStore.read().language;
-    const chinese = language === "zh-CN";
+    const copy = nativeCopyFor(stateStore.read().language);
     const confirmation = await dialog.showMessageBox(mainWindow, {
       type: "warning",
-      buttons: chinese ? ["取消", "移除"] : ["Cancel", "Remove"],
+      buttons: [copy.cancel, copy.remove],
       defaultId: 0,
       cancelId: 0,
-      title: chinese ? "移除 Codex Web GPT" : "Remove Codex Web GPT",
-      message: chinese
-        ? "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？"
-        : "Remove the ChatGPT Web models from Codex and restore the previous model route?",
-      detail: chinese
-        ? "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。"
-        : "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
+      title: copy.removeTitle,
+      message: copy.removeMessage,
+      detail: copy.removeDetail,
       noLink: true,
     });
     if (confirmation.response !== 1) return { cancelled: true };
@@ -544,22 +655,28 @@ function registerIpc({ logger, stateStore }) {
       mcpRuntimeInstalled: false,
       mcpGuideStep: 0,
       codexRestartRequired: true,
+      browserInteractionMode: "automatic",
+      experimentalBiggerContext: false,
+      zeroRiskProEnabled: false,
     });
     send("launcher:state-changed", state);
     stopCatalogVerificationMonitor();
     return { cancelled: false, state };
   });
   handle("launcher:setup-core", async () => {
-    const browser = await browserHost.probeAuthentication();
-    if (!browser.authenticated) {
-      throw new Error(
-        IS_DEV_PROFILE
-          ? "Sign in to the isolated DEV ChatGPT profile before configuring the harness"
-          : "Sign in to ChatGPT before installing the Codex integration",
-      );
-    }
     const setupState = stateStore.read();
-    if (!setupState.coreSetupComplete
+    if (setupState.browserInteractionMode === "automatic") {
+      const browser = await browserHost.probeAuthentication();
+      if (!browser.authenticated) {
+        throw new Error(
+          IS_DEV_PROFILE
+            ? "Sign in to the isolated DEV ChatGPT profile before configuring the harness"
+            : "Sign in to ChatGPT before installing the Codex integration",
+        );
+      }
+    }
+    if (setupState.browserInteractionMode === "automatic"
+      && !setupState.coreSetupComplete
       && !(smokePassedThisSession || smokePassedForCurrentVersion(setupState))) {
       throw new Error(
         IS_DEV_PROFILE
@@ -572,6 +689,7 @@ function registerIpc({ logger, stateStore }) {
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       ...(result.mode === "full" ? {
         mcpRuntimeInstalled: true,
         mcpSetupComplete: false,
@@ -591,21 +709,38 @@ function registerIpc({ logger, stateStore }) {
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
   handle("launcher:setup-mcp", async (_event, input) => {
-    await browserHost.reveal();
+    const currentMode = stateStore.read().browserInteractionMode;
+    const interactionMode = input?.interactionMode === undefined
+      ? currentMode
+      : validateBrowserInteractionMode(input.interactionMode);
+    const interactionModeChange = interactionMode !== currentMode;
     const setup = IS_DEV_PROFILE
       ? runtimeHost.setupDevMcp.bind(runtimeHost)
       : runtimeHost.setupMcp.bind(runtimeHost);
-    const result = await setup({
+    const runSetup = () => setup({
       tunnelId: typeof input?.tunnelId === "string" ? input.tunnelId.trim() : "",
       runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
       replace: input?.replace === true,
+      interactionMode,
     });
-    stateStore.update({
+    if (!interactionModeChange && interactionMode === "automatic") await browserHost.reveal();
+    const result = interactionModeChange
+      ? await browserHost.withInteractionModeChange(interactionMode, runSetup)
+      : await runSetup();
+    const state = stateStore.update({
+      browserInteractionMode: interactionMode,
+      ...(interactionMode === "manual" ? { experimentalBiggerContext: false } : {}),
+      zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      coreSetupComplete: true,
+      codexCatalogVerified: IS_DEV_PROFILE,
       mcpRuntimeInstalled: true,
       mcpSetupComplete: false,
       mcpGuideStep: 2,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
     });
+    send("launcher:state-changed", state);
+    if (interactionModeChange) send("launcher:browser-state", browserHost.snapshot());
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout };
   });
   handle("launcher:set-mcp-step", (_event, step) => {
@@ -633,6 +768,59 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
+  handle("launcher:zero-risk-pro", async (_event, enabled) => {
+    const browserOperation = browserHost.currentOperation();
+    if (browserHost.activeTraceId || browserOperation) {
+      throw new Error(
+        browserHost.activeTraceId
+          ? "Finish or cancel active ChatGPT turns before changing Zero Risk model profiles"
+          : `Finish ${browserOperation} before changing Zero Risk model profiles`,
+      );
+    }
+    const result = await runtimeHost.setZeroRiskPro(enabled === true);
+    const state = stateStore.update({
+      zeroRiskProEnabled: result.enabled,
+      codexCatalogVerified: IS_DEV_PROFILE,
+      codexRestartRequired: !IS_DEV_PROFILE,
+    });
+    send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
+  handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
+    const mode = validateBrowserInteractionMode(rawMode);
+    const current = stateStore.read();
+    if (current.browserInteractionMode === mode) {
+      return { state: current, credentialsRequired: false, targetMode: mode };
+    }
+    const browserOperation = browserHost.currentOperation();
+    if (browserHost.activeTraceId || browserOperation) {
+      throw new Error(
+        browserHost.activeTraceId
+          ? "Finish or cancel active ChatGPT turns before changing browser interaction mode"
+          : `Finish ${browserOperation} before changing browser interaction mode`,
+      );
+    }
+    if (!runtimeHost.mcpCredentialsConfigured(mode)) {
+      return { state: current, credentialsRequired: true, targetMode: mode };
+    }
+    const result = await browserHost.withInteractionModeChange(
+      mode,
+      () => runtimeHost.setBrowserInteractionMode(mode),
+    );
+    const state = stateStore.update({
+      browserInteractionMode: mode,
+      ...(mode === "manual" ? { experimentalBiggerContext: false } : {}),
+      ...(result.configured ? {
+        codexCatalogVerified: IS_DEV_PROFILE,
+        codexRestartRequired: !IS_DEV_PROFILE,
+      } : {}),
+    });
+    send("launcher:state-changed", state);
+    send("launcher:browser-state", browserHost.snapshot());
+    if (!IS_DEV_PROFILE && result.configured) startCatalogVerificationMonitor({ logger, stateStore });
+    return { state, credentialsRequired: false, targetMode: mode };
+  });
   handle("launcher:set-preference", (_event, key, value) => {
     const ordinary = key === "keepRunningOnClose" || key === "showBrowserDuringTurns";
     if (!ordinary) throw new Error("Unknown preference");
@@ -642,8 +830,9 @@ function registerIpc({ logger, stateStore }) {
   handle("launcher:logs", (_event, limit) => logger.recent(limit));
   handle("launcher:export-logs", async () => {
     const date = new Date().toISOString().slice(0, 10);
+    const copy = nativeCopyFor(stateStore.read().language);
     const result = await dialog.showSaveDialog(mainWindow, {
-      title: "Export privacy-safe diagnostics",
+      title: copy.exportDiagnostics,
       defaultPath: path.join(app.getPath("documents"), `codex-web-gpt-diagnostics-${date}.jsonl`),
       filters: [{ name: "JSON Lines", extensions: ["jsonl"] }],
     });
@@ -692,6 +881,7 @@ async function requestQuit() {
     stopCatalogVerificationMonitor();
     quitting = true;
     await browserHost?.persistSession();
+    await browserDebug?.close();
     browserHost?.destroy();
     await browserControl?.close();
     exitCommitted = true;
@@ -709,12 +899,9 @@ async function requestQuit() {
 }
 
 async function start() {
-  cdpPort = await findFreePort();
   if (process.platform === "linux") {
     app.commandLine.appendSwitch("class", IS_DEV_PROFILE ? "codex-web-gpt-dev" : "codex-web-gpt");
   }
-  app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
-  app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
 
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
@@ -722,7 +909,8 @@ async function start() {
     return;
   }
   app.on("second-instance", () => showMainWindow());
-  await app.whenReady();
+
+  await waitForPackagedRuntimeSource({ app, resourcesPath: process.resourcesPath });
   let installedRuntimeRoot = null;
   let runtimeRootResolved = false;
   const runtimeRootProvider = () => {
@@ -738,6 +926,16 @@ async function start() {
     }
     return installedRuntimeRoot;
   };
+  installedRuntimeRoot = runtimeRootProvider();
+
+  cdpPort = await findFreePort();
+  if (process.platform === "linux") {
+    app.commandLine.appendSwitch("class", IS_DEV_PROFILE ? "codex-web-gpt-dev" : "codex-web-gpt");
+  }
+  app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
+  app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
+
+  await app.whenReady();
 
   const stateStore = createStateStore(path.join(app.getPath("userData"), "launcher-state.json"));
   if (IS_DEV_PROFILE && !stateStore.read().onboardingComplete) {
@@ -782,6 +980,10 @@ async function start() {
     getBrowserHost: () => browserHost,
     getPreferences: () => stateStore.read(),
   }).start();
+  browserDebug = await new BrowserDebugServer({
+    logger,
+    getBrowserHost: () => browserHost,
+  }).start();
   runtimeSupervisor = new RuntimeSupervisor({
     app,
     logger,
@@ -805,19 +1007,29 @@ async function start() {
     launcherProfile: LAUNCHER_PROFILE.kind,
     publishOperation,
     supervisor: runtimeSupervisor,
+    getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
   });
+  const configuredInteractionMode = runtimeHost.runtimeConfigSnapshot().config?.browserInteractionMode;
+  if ((configuredInteractionMode === "automatic" || configuredInteractionMode === "manual")
+    && stateStore.read().browserInteractionMode !== configuredInteractionMode) {
+    stateStore.update({ browserInteractionMode: configuredInteractionMode });
+  }
   browserHost = new BrowserHost({
     window: mainWindow,
     descriptorPath: BROWSER_DESCRIPTOR_PATH,
-    cdpPort,
     control: browserControl.descriptor(),
+    debug: browserDebug.descriptor(),
     cancelTurn: IS_DEV_PROFILE ? undefined : traceId => runtimeSupervisor.cancelBrowserTurn(traceId),
     getConnectorName: () => runtimeHost.browserConnectorName(),
     helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
     logger,
+    loginWithPasskey: () => runtimeHost.capturePasskeyLogin(),
     partition: LAUNCHER_PROFILE.browserPartition,
     profile: LAUNCHER_PROFILE.kind,
     publishState: (state) => send("launcher:browser-state", state),
+    showWindow: showMainWindow,
+    getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
+    revokeDebugSurface: contents => browserDebug.revokeSurface(contents),
   });
   await browserHost.ready();
   const updaterRuntimeRoot = runtimeRootProvider();
@@ -835,11 +1047,11 @@ async function start() {
     logger,
   });
   registerIpc({ logger, stateStore });
-  const trayAvailable = createTray(logger);
+  const trayAvailable = createTray(logger, stateStore.read().language);
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
   let startupAuthenticationRefresh = Promise.resolve();
-  if (!launcherSmokeTest) {
+  if (!launcherSmokeTest && stateStore.read().browserInteractionMode === "automatic") {
     startupAuthenticationRefresh = browserHost.refreshAuthentication().catch((error) => {
       logger.warn("browser.session_refresh_failed", {
         ...navigationErrorForLog(error),
@@ -880,6 +1092,7 @@ async function start() {
       packaged: app.isPackaged,
       runtimeVerified: true,
     })}\n`);
+    await browserDebug.close();
     browserHost.destroy();
     await browserControl.close();
     mainWindow.destroy();
@@ -903,6 +1116,7 @@ async function start() {
       codexRestartRequired: false,
       autoStart: false,
       experimentalBiggerContext: config?.experimentalBiggerContext === true,
+      zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
     });
     send("launcher:state-changed", state);
     logger.info("dev_profile.ready", {
@@ -928,6 +1142,7 @@ async function start() {
         codexCatalogVerified: false,
         codexRestartRequired: true,
         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
+        zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
           mcpSetupComplete: false,
@@ -949,8 +1164,11 @@ async function start() {
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
       const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
-      if (stateStore.read().experimentalBiggerContext !== enabled) {
-        const state = stateStore.update({ experimentalBiggerContext: enabled });
+      const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
+      const saved = stateStore.read();
+      if (saved.experimentalBiggerContext !== enabled
+        || saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
+        const state = stateStore.update({ experimentalBiggerContext: enabled, zeroRiskProEnabled });
         send("launcher:state-changed", state);
       }
     }
@@ -966,6 +1184,7 @@ async function start() {
         coreSetupComplete: true,
         mcpRuntimeInstalled: config.mode === "full",
         experimentalBiggerContext: config.experimentalBiggerContext === true,
+        zeroRiskProEnabled: config.zeroRiskProEnabled === true,
         ...(runtime.bridgeRouteChanged ? {
           codexCatalogVerified: false,
           codexRestartRequired: true,
@@ -1050,7 +1269,10 @@ async function start() {
 void start().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   try {
-    fs.appendFileSync(path.join(app.getPath("logs"), "launcher-fatal.log"), `${new Date().toISOString()} ${error?.stack || error}\n`);
+    fs.appendFileSync(
+      path.join(app.getPath("logs"), "launcher-fatal.log"),
+      `${new Date().toISOString()} ${redactText(error?.stack || String(error))}\n`,
+    );
   } catch {}
   try {
     dialog.showErrorBox("Codex Web GPT could not start", message);
