@@ -123,8 +123,8 @@ test("launcher-owned links and downloads target the hardened fork", () => {
   assert.equal(repositoryManifest.homepage, `https://github.com/${distributionRepository}#readme`);
   assert.equal(repositoryManifest.bugs.url, `https://github.com/${distributionRepository}/issues`);
   for (const documentation of [readme, readmeZh]) {
-    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/latest/download/install-launcher.sh`));
-    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/latest/download/install-launcher.ps1`));
+    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/download/v${repositoryManifest.version}/install-launcher.sh`));
+    assert.ok(documentation.includes(`https://github.com/${distributionRepository}/releases/download/v${repositoryManifest.version}/install-launcher.ps1`));
     assert.ok(documentation.includes(`git clone https://github.com/${distributionRepository}.git`));
   }
 });

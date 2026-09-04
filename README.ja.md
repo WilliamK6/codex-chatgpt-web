@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/WilliamK6/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/WilliamK6/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT ライセンス"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 および x64">
   <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
@@ -77,13 +77,13 @@ Full モードでは、次のコンパクション境界まで、MCP が ChatGPT
 **macOS または Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.ps1 | iex
 ```
 
 アプリ内で次の 3 項目を完了します。
@@ -104,7 +104,7 @@ Free/Go アカウントでは Luna のみが表示され、Pro はサインイ�
 **ソースから実行**
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/WilliamK6/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```

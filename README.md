@@ -78,13 +78,13 @@ preserving the ChatGPT profile and launcher configuration.
 **macOS or Linux**
 
 ```bash
-curl -fsSL https://github.com/WilliamK6/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/WilliamK6/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.ps1 | iex
 ```
 
 Then complete the three checks in the app:

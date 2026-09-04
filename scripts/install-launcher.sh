@@ -2,7 +2,7 @@
 set -eu
 
 REPOSITORY="${CODEX_WEB_GPT_REPOSITORY:-WilliamK6/codex-chatgpt-web}"
-VERSION="${CODEX_WEB_GPT_VERSION:-}"
+VERSION="${CODEX_WEB_GPT_VERSION:-5.0.0-mbp.1}"
 OS="$(uname -s)"
 MACHINE="$(uname -m)"
 
@@ -32,12 +32,6 @@ case "$OS" in
   *) echo "Use install-launcher.ps1 on Windows; unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
-if [ -z "$VERSION" ]; then
-  VERSION="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
-    "https://api.github.com/repos/$REPOSITORY/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' \
-    | head -n 1)"
-fi
 VERSION="${VERSION#v}"
 if [ -z "$VERSION" ]; then
   echo "Could not resolve the latest Codex Web GPT release" >&2

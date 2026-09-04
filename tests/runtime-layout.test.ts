@@ -138,7 +138,7 @@ test("the DEV profile uses a distinct connector identity without overwriting cus
   expect(resolveDevSetupConnectorName(undefined, "Explicit DEV Harness")).toBe("Explicit DEV Harness");
 });
 
-test("setup explicitly migrates v1 pro-only config to v3 managed browser-only", () => {
+test("setup explicitly migrates v1 pro-only config to v4 managed browser-only", () => {
   const root = join(tmpdir(), `codex-chatgpt-web-config-migration-${process.pid}-${Date.now()}`);
   roots.push(root);
   process.env.CODEX_CHATGPT_WEB_HOME = root;
@@ -163,7 +163,7 @@ test("setup explicitly migrates v1 pro-only config to v3 managed browser-only", 
 
   expect(() => loadConfig()).toThrow("rerun setup to migrate");
   expect(loadConfigForSetup()).toMatchObject({
-    version: 3,
+    version: 4,
     mode: "browser-only",
     browserHost: "managed-chrome",
     browserInteractionMode: "automatic",

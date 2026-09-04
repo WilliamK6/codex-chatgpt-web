@@ -27,15 +27,22 @@ import {
 } from "../src/codex-integration-shared";
 
 const roots: string[] = [];
+const TEST_RESPONSES_TOKEN = "test-responses-token-0123456789abcdefghijklmnop";
+
+function testRoute(port = 17841): string {
+  return `http://127.0.0.1:${port}/${TEST_RESPONSES_TOKEN}/v1`;
+}
 
 function nativeConfig(mode: "browser-only" | "full") {
   const config = defaultConfig(mode);
+  config.responsesToken = TEST_RESPONSES_TOKEN;
   config.subagentProtocol = "native";
   return config;
 }
 
 function compatibilityV1Config(mode: "browser-only" | "full") {
   const config = defaultConfig(mode);
+  config.responsesToken = TEST_RESPONSES_TOKEN;
   config.subagentProtocol = "compatibility-v1";
   return config;
 }
@@ -48,6 +55,9 @@ function fixture(): { root: string; codexHome: string; appHome: string } {
   roots.push(root);
   process.env.CODEX_HOME = codexHome;
   process.env.CODEX_CHATGPT_WEB_HOME = appHome;
+  const config = defaultConfig("browser-only");
+  config.responsesToken = TEST_RESPONSES_TOKEN;
+  saveConfig(config);
   return { root, codexHome, appHome };
 }
 
@@ -88,7 +98,7 @@ describe("reversible native Codex route integration", () => {
     const journal = installCodexIntegration(nativeConfig("browser-only"));
     const installed = readFileSync(configPath, "utf8");
     expect(journal.version).toBe(9);
-    expect(installed).toContain('openai_base_url = "http://127.0.0.1:17841/v1"');
+    expect(installed).toContain(`openai_base_url = ${JSON.stringify(testRoute())}`);
     expect(installed).toContain(
       `experimental_realtime_webrtc_call_base_url = ${JSON.stringify(CODEX_REALTIME_WEBRTC_CALL_BASE_URL)}`,
     );
@@ -128,7 +138,7 @@ describe("reversible native Codex route integration", () => {
     expect(installed).toContain("multi_agent = false # native choice");
     expect(installed).toContain("multi_agent_v2 = true # native choice");
     expect(journal.installed).toEqual({
-      openai_base_url: "http://127.0.0.1:17841/v1",
+      openai_base_url: testRoute(),
       experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
       subagent_protocol: "native",
     });
@@ -592,7 +602,7 @@ describe("reversible native Codex route integration", () => {
     expect(() => installCodexIntegration(config)).toThrow("--replace-codex-route");
     installCodexIntegration(config, { replaceExistingRoute: true });
     const installed = readFileSync(configPath, "utf8");
-    expect(installed).toContain('openai_base_url = "http://127.0.0.1:17841/v1"');
+    expect(installed).toContain(`openai_base_url = ${JSON.stringify(testRoute())}`);
     expect(installed).toContain('model_provider = "existing-provider"');
     expect(installed).toContain('model_catalog_json = "/tmp/native.json"');
 
@@ -651,7 +661,7 @@ describe("reversible native Codex route integration", () => {
     const second = nativeConfig("browser-only");
     second.port = 17842;
     installCodexIntegration(second);
-    expect(readFileSync(configPath, "utf8")).toContain('openai_base_url = "http://127.0.0.1:17842/v1"');
+    expect(readFileSync(configPath, "utf8")).toContain(`openai_base_url = ${JSON.stringify(testRoute(17842))}`);
     uninstallCodexIntegration();
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
   });
@@ -670,7 +680,7 @@ describe("reversible native Codex route integration", () => {
 
     expect(activateCodexIntegration()).toEqual({ changed: true, active: true });
     const reconnected = readFileSync(configPath, "utf8");
-    expect(reconnected).toContain('openai_base_url = "http://127.0.0.1:17841/v1"');
+    expect(reconnected).toContain(`openai_base_url = ${JSON.stringify(testRoute())}`);
     expect(reconnected).not.toContain("remote_compaction_v2");
     expect(reconnected).not.toContain("multi_agent");
     expect(reconnected).toContain('approval_policy = "never"');

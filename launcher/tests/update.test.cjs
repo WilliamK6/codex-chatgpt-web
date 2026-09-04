@@ -11,6 +11,7 @@ const {
   expectedChecksum,
   macApplicationPath,
   releaseAssetName,
+  selectCustomRelease,
   validateReleaseAssetUrl,
 } = require("../electron/update.cjs");
 
@@ -42,11 +43,40 @@ test("release comparison and platform assets are strict", () => {
   assert.equal(compareVersions("1.1.4", "1.1.4"), 0);
   assert.equal(compareVersions("1.1.3", "1.1.4"), -1);
   assert.equal(compareVersions("1.2.0", "1.1.99"), 1);
+  assert.equal(compareVersions("5.0.0-mbp.10", "5.0.0-mbp.2"), 1);
   assert.equal(releaseAssetName("1.2.0", "darwin", "arm64"), "codex-web-gpt-1.2.0-mac-arm64.zip");
   assert.equal(releaseAssetName("1.2.0", "darwin", "x64"), "codex-web-gpt-1.2.0-mac-x64.zip");
   assert.equal(releaseAssetName("1.2.0", "win32", "x64"), "codex-web-gpt-1.2.0-win-x64.exe");
   assert.equal(releaseAssetName("1.2.0", "linux", "x64"), "codex-web-gpt-1.2.0-linux-x64.AppImage");
   assert.equal(releaseAssetName("1.2.0", "linux", "arm64"), null);
+});
+
+test("custom update selection ignores stable, draft, incomplete, malformed, and foreign releases", () => {
+  const asset = (version, repository = "WilliamK6/codex-chatgpt-web") => ({
+    name: `codex-web-gpt-${version}-mac-arm64.zip`,
+    browser_download_url: `https://github.com/${repository}/releases/download/v${version}/codex-web-gpt-${version}-mac-arm64.zip`,
+  });
+  const checksums = (version, repository = "WilliamK6/codex-chatgpt-web") => ({
+    name: "checksums.txt",
+    browser_download_url: `https://github.com/${repository}/releases/download/v${version}/checksums.txt`,
+  });
+  const releases = [
+    { tag_name: "v9.0.0", draft: false, published_at: "2026-09-05T00:00:00Z", assets: [] },
+    { tag_name: "v5.0.0-mbp.bad", draft: false, published_at: "2026-09-05T00:00:00Z", assets: [] },
+    { tag_name: "v5.0.0-mbp.9", draft: true, published_at: "2026-09-05T00:00:00Z", assets: [asset("5.0.0-mbp.9"), checksums("5.0.0-mbp.9")] },
+    { tag_name: "v5.0.0-mbp.8", draft: false, published_at: "2026-09-05T00:00:00Z", assets: [asset("5.0.0-mbp.8")] },
+    { tag_name: "v5.0.0-mbp.7", draft: false, published_at: "2026-09-05T00:00:00Z", assets: [asset("5.0.0-mbp.7", "miuuyy/codex-chatgpt-web"), checksums("5.0.0-mbp.7", "miuuyy/codex-chatgpt-web")] },
+    { tag_name: "v5.0.0-mbp.2", draft: false, published_at: "2026-09-04T12:00:00Z", assets: [asset("5.0.0-mbp.2"), checksums("5.0.0-mbp.2")] },
+    { tag_name: "v5.0.0-mbp.3", draft: false, published_at: "2026-09-04T13:00:00Z", assets: [asset("5.0.0-mbp.3"), checksums("5.0.0-mbp.3")] },
+  ];
+
+  assert.deepEqual(selectCustomRelease(releases, "darwin", "arm64"), {
+    version: "5.0.0-mbp.3",
+    assetName: "codex-web-gpt-5.0.0-mbp.3-mac-arm64.zip",
+    assetUrl: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.3/codex-web-gpt-5.0.0-mbp.3-mac-arm64.zip",
+    checksumsUrl: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.3/checksums.txt",
+    publishedAt: "2026-09-04T13:00:00Z",
+  });
 });
 
 test("checksums and release URLs bind the exact expected asset", () => {
@@ -87,7 +117,7 @@ test("startup check runs once and exposes only a newer complete release", async 
   let calls = 0;
   const published = [];
   const controller = createUpdateController({
-    currentVersion: "1.1.4",
+    currentVersion: "1.1.4-mbp.1",
     platform: "linux",
     arch: "x64",
     packaged: true,
@@ -96,26 +126,28 @@ test("startup check runs once and exposes only a newer complete release", async 
     logsDirectory: "/tmp/logs",
     publish: (state) => published.push(state),
     dependencies: {
-      fetchRelease: async () => {
+      fetchReleases: async () => {
         calls += 1;
-        return {
-          tag_name: "v1.2.0",
+        return [{
+          tag_name: "v1.2.0-mbp.1",
+          draft: false,
+          published_at: "2026-09-04T12:00:00Z",
           assets: [
             {
-              name: "codex-web-gpt-1.2.0-linux-x64.AppImage",
-              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-x64.AppImage",
+              name: "codex-web-gpt-1.2.0-mbp.1-linux-x64.AppImage",
+              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0-mbp.1/codex-web-gpt-1.2.0-mbp.1-linux-x64.AppImage",
             },
             {
               name: "checksums.txt",
-              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
+              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0-mbp.1/checksums.txt",
             },
           ],
-        };
+        }];
       },
     },
   });
-  assert.deepEqual(await controller.checkOnce(), { status: "available", version: "1.2.0" });
-  assert.deepEqual(await controller.checkOnce(), { status: "available", version: "1.2.0" });
+  assert.deepEqual(await controller.checkOnce(), { status: "available", version: "1.2.0-mbp.1" });
+  assert.deepEqual(await controller.checkOnce(), { status: "available", version: "1.2.0-mbp.1" });
   assert.equal(calls, 1);
   assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
 });
@@ -145,20 +177,22 @@ test("verified update is handed to one detached worker", async () => {
       runtimeExecutable: "/durable/bun",
       logsDirectory: path.join(root, "logs"),
       dependencies: {
-        fetchRelease: async () => ({
-          tag_name: "v1.2.0",
+        fetchReleases: async () => [{
+          tag_name: "v1.2.0-mbp.1",
+          draft: false,
+          published_at: "2026-09-04T12:00:00Z",
           assets: [
             {
-              name: "codex-web-gpt-1.2.0-linux-x64.AppImage",
-              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0/codex-web-gpt-1.2.0-linux-x64.AppImage",
+              name: "codex-web-gpt-1.2.0-mbp.1-linux-x64.AppImage",
+              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0-mbp.1/codex-web-gpt-1.2.0-mbp.1-linux-x64.AppImage",
             },
             {
               name: "checksums.txt",
-              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0/checksums.txt",
+              browser_download_url: "https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v1.2.0-mbp.1/checksums.txt",
             },
           ],
-        }),
-        downloadText: async () => `${hash}  codex-web-gpt-1.2.0-linux-x64.AppImage\n`,
+        }],
+        downloadText: async () => `${hash}  codex-web-gpt-1.2.0-mbp.1-linux-x64.AppImage\n`,
         downloadFile: async (_url, destination) => fs.writeFileSync(destination, assetBody),
         sha256: (filePath) => require("node:crypto").createHash("sha256").update(fs.readFileSync(filePath)).digest("hex"),
         spawnWorker: (runtime, worker, job) => {
@@ -170,7 +204,7 @@ test("verified update is handed to one detached worker", async () => {
     await controller.checkOnce();
     const launch = await controller.beginInstall();
     assert.equal(spawned.runtime, "/durable/bun");
-    assert.equal(spawned.data.version, "1.2.0");
+    assert.equal(spawned.data.version, "1.2.0-mbp.1");
     assert.equal(spawned.data.target, oldAppImage);
     assert.equal(spawned.data.wrapper, wrapper);
     assert.equal(path.basename(spawned.data.runnerSource), "linux-appimage-runner.sh");
@@ -178,7 +212,7 @@ test("verified update is handed to one detached worker", async () => {
     assert.equal(controller.getState().status, "installing");
     controller.cancelInstall(launch);
     assert.equal(fs.existsSync(launch.tempRoot), false);
-    assert.deepEqual(controller.getState(), { status: "available", version: "1.2.0" });
+    assert.deepEqual(controller.getState(), { status: "available", version: "1.2.0-mbp.1" });
   } finally {
     if (previousAppImage === undefined) delete process.env.CODEX_WEB_GPT_APPIMAGE;
     else process.env.CODEX_WEB_GPT_APPIMAGE = previousAppImage;

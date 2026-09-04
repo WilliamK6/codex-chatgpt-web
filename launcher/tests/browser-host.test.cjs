@@ -24,6 +24,8 @@ const {
   navigationOriginForLog,
 } = require("../electron/browser-host.cjs");
 
+const DEBUG_LEASE_TOKEN = "debug-lease-token-0123456789abcdefghijklmnopqr";
+
 test("manual prompt handoff has one thirty-second user deadline", () => {
   assert.equal(MANUAL_SUBMIT_TIMEOUT_MS, 30_000);
 });
@@ -1343,6 +1345,8 @@ test("browser helper operations fail closed when the configured connector name i
 
 test("connector verification is effort-independent and works while the browser surface is hidden", async () => {
   const calls = [];
+  const onSpawn = () => {};
+  const onExit = () => {};
   const fixture = {
     helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
     descriptorPath: "/runtime/launcher-browser.json",
@@ -1357,6 +1361,11 @@ test("connector verification is effort-independent and works while the browser s
       calls.push(["helper", options]);
       return { ok: true, appName: options.appName };
     },
+    browserHelperAuthorization: () => ({
+      debugLeaseToken: DEBUG_LEASE_TOKEN,
+      onSpawn,
+      onExit,
+    }),
   };
 
   const result = await BrowserHost.prototype.runConnectorVerification.call(fixture, "Codex Native2");
@@ -1372,6 +1381,9 @@ test("connector verification is effort-independent and works while the browser s
         descriptorPath: fixture.descriptorPath,
         appName: "Codex Native2",
         logger: fixture.logger,
+        debugLeaseToken: DEBUG_LEASE_TOKEN,
+        onSpawn,
+        onExit,
       }],
     ],
   );
@@ -1428,10 +1440,12 @@ test("a replacement helper takes over only after the previous owner exited", asy
 
   assert.deepEqual(lease, {
     surfaceId: tab.surfaceId,
+    debugLeaseToken: lease.debugLeaseToken,
     tabId: tab.id,
     reused: false,
     connectorBound: false,
   });
+  assert.match(lease.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
   assert.equal(tab.helperPid, process.pid);
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0][0], "browser.stale_turn_owner_replaced");
@@ -2039,10 +2053,12 @@ test("a later provider round reuses only its exact connector-bound conversation"
 
   assert.deepEqual(lease, {
     surfaceId: "surface-reused",
+    debugLeaseToken: lease.debugLeaseToken,
     tabId: "tab-reused",
     reused: true,
     connectorBound: true,
   });
+  assert.match(lease.debugLeaseToken, /^[A-Za-z0-9_-]{40,}$/);
   assert.equal(tab.traceId, "trace_next");
   assert.equal(tab.helperPid, 222);
   assert.equal(tab.status, "running");
@@ -2064,7 +2080,7 @@ test("a retained conversation is not reused for a different connector identity",
     connectorIdentity: "Codex Native2",
     connectorBound: true,
   };
-  const created = { id: "fresh", surfaceId: "surface-fresh" };
+  const created = { id: "fresh", surfaceId: "surface-fresh", debugLeaseToken: DEBUG_LEASE_TOKEN };
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     manualOperation: null,
     turnTabs: new Map([[retained.id, retained]]),
@@ -2090,6 +2106,7 @@ test("a retained conversation is not reused for a different connector identity",
 
   assert.deepEqual(lease, {
     surfaceId: "surface-fresh",
+    debugLeaseToken: DEBUG_LEASE_TOKEN,
     tabId: "fresh",
     reused: false,
     connectorBound: false,
@@ -2111,7 +2128,7 @@ test("a connector conversation is not reused until its connector was bound", asy
     manualOperation: null,
     turnTabs: new Map([[retained.id, retained]]),
     userCancelledTurnOwners: new Map(),
-    createTurnTab: () => ({ id: "fresh", surfaceId: "surface-fresh" }),
+    createTurnTab: () => ({ id: "fresh", surfaceId: "surface-fresh", debugLeaseToken: DEBUG_LEASE_TOKEN }),
     syncViewVisibility() {},
     publishState() {},
     snapshot: () => ({ tabs: [] }),
@@ -2129,6 +2146,7 @@ test("a connector conversation is not reused until its connector was bound", asy
     ),
     {
       surfaceId: "surface-fresh",
+      debugLeaseToken: DEBUG_LEASE_TOKEN,
       tabId: "fresh",
       reused: false,
       connectorBound: false,

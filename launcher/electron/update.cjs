@@ -7,9 +7,10 @@ const { spawn, spawnSync } = require("node:child_process");
 const { pipeline } = require("node:stream/promises");
 
 const REPOSITORY = "WilliamK6/codex-chatgpt-web";
-const RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases/latest`;
+const RELEASE_API_URL = `https://api.github.com/repos/${REPOSITORY}/releases?per_page=100`;
 const USER_AGENT = "codex-web-gpt-launcher-updater";
 const MAX_REDIRECTS = 5;
+const CUSTOM_RELEASE_TAG = /^v\d+\.\d+\.\d+-mbp\.\d+$/;
 
 function parseVersion(value) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(value || "").trim());
@@ -41,6 +42,11 @@ function releaseVersion(tagName) {
   return version;
 }
 
+function customReleaseVersion(tagName) {
+  const tag = String(tagName || "").trim();
+  return CUSTOM_RELEASE_TAG.test(tag) ? releaseVersion(tag) : null;
+}
+
 function releaseAssetName(version, platform = process.platform, arch = process.arch) {
   if (platform === "darwin" && ["arm64", "x64"].includes(arch)) {
     return `codex-web-gpt-${version}-mac-${arch}.zip`;
@@ -69,6 +75,44 @@ function validateReleaseAssetUrl(raw, version, assetName) {
     throw new Error(`GitHub returned an unexpected release asset URL for ${assetName}`);
   }
   return url.toString();
+}
+
+function releaseCandidate(release, platform, arch) {
+  if (!release || typeof release !== "object" || release.draft === true) return null;
+  if (typeof release.published_at !== "string" || Number.isNaN(Date.parse(release.published_at))) return null;
+  const version = customReleaseVersion(release.tag_name);
+  if (!version) return null;
+  const assetName = releaseAssetName(version, platform, arch);
+  if (!assetName) return null;
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const asset = assets.find((item) => item?.name === assetName);
+  const checksums = assets.find((item) => item?.name === "checksums.txt");
+  if (!asset?.browser_download_url || !checksums?.browser_download_url) return null;
+  try {
+    return {
+      version,
+      assetName,
+      assetUrl: validateReleaseAssetUrl(asset.browser_download_url, version, assetName),
+      checksumsUrl: validateReleaseAssetUrl(checksums.browser_download_url, version, "checksums.txt"),
+      publishedAt: release.published_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function selectCustomRelease(releases, platform = process.platform, arch = process.arch) {
+  if (!Array.isArray(releases)) throw new Error("GitHub returned invalid release metadata");
+  const candidates = releases
+    .map((release) => releaseCandidate(release, platform, arch))
+    .filter(Boolean)
+    .sort((left, right) => {
+      const versionOrder = compareVersions(right.version, left.version);
+      return versionOrder !== 0
+        ? versionOrder
+        : Date.parse(right.publishedAt) - Date.parse(left.publishedAt);
+    });
+  return candidates[0] || null;
 }
 
 function request(url, redirects = 0) {
@@ -207,7 +251,7 @@ function buildJob({ version, platform, executablePath, assetPath, stagingRoot, t
 
 function defaultDependencies() {
   return {
-    fetchRelease: async () => JSON.parse(await downloadText(RELEASE_API_URL)),
+    fetchReleases: async () => JSON.parse(await downloadText(RELEASE_API_URL)),
     downloadText,
     downloadFile,
     sha256,
@@ -274,25 +318,21 @@ function createUpdateController({
     checked = true;
     transition({ status: "checking" });
     try {
-      const release = await deps.fetchRelease();
-      const version = releaseVersion(release?.tag_name);
+      const selected = selectCustomRelease(await deps.fetchReleases(), platform, arch);
+      if (!selected) {
+        candidate = null;
+        return transition({ status: "up-to-date" });
+      }
+      const { version } = selected;
       if (compareVersions(version, currentVersion) <= 0) {
         candidate = null;
         return transition({ status: "up-to-date" });
       }
-      const assetName = releaseAssetName(version, platform, arch);
-      if (!assetName) return transition({ status: "disabled" });
-      const assets = Array.isArray(release?.assets) ? release.assets : [];
-      const asset = assets.find((item) => item?.name === assetName);
-      const checksums = assets.find((item) => item?.name === "checksums.txt");
-      if (!asset?.browser_download_url || !checksums?.browser_download_url) {
-        throw new Error(`Release v${version} is missing ${assetName} or checksums.txt`);
-      }
       candidate = {
         version,
-        assetName,
-        assetUrl: validateReleaseAssetUrl(asset.browser_download_url, version, assetName),
-        checksumsUrl: validateReleaseAssetUrl(checksums.browser_download_url, version, "checksums.txt"),
+        assetName: selected.assetName,
+        assetUrl: selected.assetUrl,
+        checksumsUrl: selected.checksumsUrl,
       };
       logger?.info("launcher.update_available", { currentVersion, version, platform, arch });
       return transition({ status: "available", version });
@@ -381,6 +421,7 @@ module.exports = {
   macApplicationPath,
   parseVersion,
   releaseAssetName,
+  selectCustomRelease,
   releaseVersion,
   validateReleaseAssetUrl,
 };

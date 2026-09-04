@@ -7,6 +7,14 @@ const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME } = require("../electron/conn
 const { RuntimeHost } = require("../electron/runtime.cjs");
 
 function hostFor(existingConfig, interactionMode = "automatic") {
+  const configured = existingConfig && existingConfig.version === undefined
+    ? {
+        version: 4,
+        controlToken: "runtime-host-control-token-0123456789abcdef",
+        responsesToken: "runtime-host-responses-token-0123456789abcdef",
+        ...existingConfig,
+      }
+    : existingConfig;
   const host = new RuntimeHost({
     app: {
       getPath: () => path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
@@ -16,8 +24,8 @@ function hostFor(existingConfig, interactionMode = "automatic") {
     sourceRoot: "/source",
     browserDescriptorPath: "/runtime/launcher-browser.json",
     supervisor: {
-      readConfig: () => existingConfig,
-      readSetupConfig: () => existingConfig,
+      readConfig: () => configured,
+      readSetupConfig: () => configured,
       stopForSetup: async () => ({ status: "stopped" }),
       startIfConfigured: async () => ({ status: "ready" }),
     },
@@ -398,6 +406,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     fromVersion: "1.1.1",
     toVersion: "1.1.3",
     connectorMigrated: false,
+    configMigrated: false,
     stdout: "",
   });
 });

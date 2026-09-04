@@ -406,11 +406,14 @@ test("browser check uses metadata-only launcher liveness in Zero Risk", async ()
     mkdirSync(join(appHome, "runtime"), { recursive: true });
     writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
     writeFileSync(descriptorPath, `${JSON.stringify({
-      version: 2,
+      version: 3,
       kind: "codex-web-gpt-launcher",
       profile: "production",
       pid: process.pid,
-      endpoint: `http://127.0.0.1:${address.port}`,
+      debug: {
+        endpoint: `tcp://127.0.0.1:${address.port}`,
+        token: "manual-browser-debug-token-0123456789abcdefghijklmnop",
+      },
       control: {
         endpoint: "http://127.0.0.1:48143",
         token: "manual-browser-check-token-0123456789abcdefghijklmnop",
@@ -445,7 +448,7 @@ test("browser check uses metadata-only launcher liveness in Zero Risk", async ()
     });
     expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
     expect(result.stdout).toContain("DOM inspection is intentionally disabled");
-    expect(requests).toBe(1);
+    expect(requests).toBe(0);
   } finally {
     await new Promise<void>(resolveClose => cdp.close(() => resolveClose()));
     rmSync(root, { recursive: true, force: true });

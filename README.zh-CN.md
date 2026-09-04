@@ -72,13 +72,13 @@ Codex 会保留原生任务、上下文生命周期、界面和工具 harness。
 **macOS 或 Linux**
 
 ```bash
-curl -fsSL https://github.com/WilliamK6/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/WilliamK6/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/WilliamK6/codex-chatgpt-web/releases/download/v5.0.0-mbp.1/install-launcher.ps1 | iex
 ```
 
 然后在应用中完成三项检查：

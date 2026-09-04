@@ -24,6 +24,7 @@ import {
 import type { Browser, BrowserContext, Page } from "playwright-core";
 
 const roots: string[] = [];
+const DEBUG_LEASE_TOKEN = "debug-lease-token-0123456789abcdefghijklmnopqr";
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -32,17 +33,20 @@ afterEach(() => {
 function descriptorFile(
   controlEndpoint = "http://127.0.0.1:39111",
   profile: "production" | "development" = "production",
-  endpoint = "http://127.0.0.1:39110",
+  debugEndpoint = "tcp://127.0.0.1:39110",
 ): string {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-descriptor-"));
   roots.push(root);
   const path = join(root, "launcher-browser.json");
   writeFileSync(path, `${JSON.stringify({
-    version: 2,
+    version: 3,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
-    endpoint,
+    debug: {
+      endpoint: debugEndpoint,
+      token: "launcher-debug-token-0123456789abcdefghijklmnopqr",
+    },
     control: {
       endpoint: controlEndpoint,
       token: "launcher-control-token-0123456789abcdefghijklmnop",
@@ -67,7 +71,7 @@ test("launcher descriptor is owner-only, loopback-only, and process-bound", () =
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: "production",
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39110",
+    debug: { endpoint: "tcp://127.0.0.1:39110" },
     surfaceId: "launcher_surface_id_0123456789AB",
   });
   if (process.platform !== "win32") {
@@ -87,7 +91,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
     };
     response.writeHead(200, { "content-type": "application/json" });
     response.end(request.url === "/v1/turn/start"
-      ? '{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","reused":true,"connectorBound":true}\n'
+      ? `{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB","debugLeaseToken":"${DEBUG_LEASE_TOKEN}","reused":true,"connectorBound":true}\n`
       : request.url === "/v1/turn/end"
         ? '{"ok":true,"cancelledByUser":false}\n'
         : '{"ok":true}\n');
@@ -109,6 +113,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       requireRetainedConversation: true,
     })).resolves.toEqual({
       surfaceId: "launcher_surface_id_0123456789AB",
+      debugLeaseToken: DEBUG_LEASE_TOKEN,
       reused: true,
       connectorBound: true,
     });
@@ -276,38 +281,18 @@ test("launcher session verification uses the authenticated control channel inste
   }
 });
 
-test("launcher liveness verification checks only owned process and loopback CDP metadata", async () => {
-  let requests = 0;
-  const server = createServer((request, response) => {
-    requests += 1;
-    expect(request.url).toBe("/json/version");
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({
-      webSocketDebuggerUrl: "ws://127.0.0.1:39120/devtools/browser/test",
-    }));
+test("launcher liveness verification checks only owned process and private debug metadata", async () => {
+  const path = descriptorFile(
+    "http://127.0.0.1:39111",
+    "development",
+    "tcp://127.0.0.1:39120",
+  );
+  await expect(inspectLauncherBrowserHostLiveness(path, {
+    expectedProfile: "development",
+  })).resolves.toMatchObject({
+    profile: "development",
+    debug: { endpoint: "tcp://127.0.0.1:39120" },
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  try {
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("test server has no port");
-    const path = descriptorFile(
-      "http://127.0.0.1:39111",
-      "development",
-      `http://127.0.0.1:${address.port}`,
-    );
-    await expect(inspectLauncherBrowserHostLiveness(path, {
-      expectedProfile: "development",
-    })).resolves.toMatchObject({
-      profile: "development",
-      endpoint: `http://127.0.0.1:${address.port}`,
-    });
-    expect(requests).toBe(1);
-  } finally {
-    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
-  }
 });
 
 test("launcher session verification reports its own deadline instead of a generic abort", async () => {
@@ -337,9 +322,9 @@ test("launcher session verification reports its own deadline instead of a generi
 test("launcher descriptor rejects non-loopback browser ownership", () => {
   const path = descriptorFile();
   const value = JSON.parse(readFileSync(path, "utf8"));
-  value.endpoint = "https://example.com:443";
+  value.debug.endpoint = "tcp://example.com:443";
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("http://127.0.0.1");
+  expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("tcp://127.0.0.1");
 });
 
 test("launcher profile checks reject cross-profile browser ownership", async () => {
