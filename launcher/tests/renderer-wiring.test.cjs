@@ -82,6 +82,11 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
 });
 
 test("packaged runtime is verified before launcher browser surfaces can bind ports", () => {
+  assert.match(electronMain, /const net = require\("node:net"\);/);
+  assert.match(
+    electronMain,
+    /function findFreePort\(\) \{[\s\S]*?net\.createServer\(\)[\s\S]*?server\.listen\(0, "127\.0\.0\.1"/,
+  );
   const start = electronMain.indexOf("async function start()");
   const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);
   const cdpPortAllocation = electronMain.indexOf("cdpPort = await findFreePort();", start);
